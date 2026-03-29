@@ -68,6 +68,38 @@ EXCLUDED_SYMBOLS = {
     "DNA", "GRAB", "NU", "RKLB", "VFS", "SMCI",
 }
 
+# Hardcoded universe — S&P 500 + Nasdaq 100 stocks we trained on.
+# More reliable than scraping Wikipedia (which gets blocked by Railway).
+# Update this list every few months when index composition changes.
+STOCK_UNIVERSE = [
+    "AA", "AAL", "AAOI", "AAPL", "ABBV", "ABNB", "ABT", "ACAD", "ACN", "ADBE", "ADI", "ADP",
+    "AEM", "AEO", "AG", "AIG", "ALL", "AMAT", "AMCR", "AMD", "AMGN", "AMPX", "AMT", "AMZN",
+    "ANET", "APA", "APLS", "AR", "ARCT", "AVGO", "AXON", "AXP", "BA", "BAC", "BCS", "BDX",
+    "BEAM", "BIIB", "BITF", "BKNG", "BKR", "BLK", "BMNR", "BMY", "BN", "BP", "BRK-B", "BTBT",
+    "BTCZ", "BTG", "BVN", "BX", "C", "CAT", "CB", "CCI", "CCL", "CDE", "CDNS", "CENX", "CHRD",
+    "CI", "CIFR", "CLF", "CLSK", "CMCSA", "CMG", "CMI", "CNC", "CNQ", "COHR", "COIN", "COP",
+    "COST", "CPB", "CRCL", "CRGY", "CRM", "CRSP", "CRWD", "CSCO", "CSX", "CTRA", "CVX", "CZR",
+    "DAC", "DAL", "DASH", "DAWN", "DDOG", "DE", "DELL", "DG", "DHR", "DHT", "DIS", "DKNG",
+    "DLTR", "DOCU", "DOW", "DUK", "DVN", "EDIT", "EMR", "EOG", "EQNR", "EQT", "EQX", "ET",
+    "ETN", "EWY", "EXAS", "F", "FANG", "FATE", "FCX", "FDX", "FIGR", "FITB", "FRO", "FTI",
+    "FXI", "GAP", "GD", "GE", "GILD", "GOLD", "GOOG", "GOOGL", "GS", "HAL", "HALO", "HD",
+    "HDB", "HIMS", "HL", "HON", "HP", "HUT", "IBM", "INSW", "INTC", "INTU", "IOT", "ISRG",
+    "JNJ", "JPM", "KGC", "KKR", "KLAC", "KMI", "KO", "LIN", "LLY", "LMT", "LOW", "LRCX",
+    "LULU", "LUV", "LYB", "LYFT", "MA", "MARA", "MCD", "MDLZ", "MDT", "MET", "META", "MGM",
+    "MO", "MOS", "MPC", "MRK", "MRNA", "MRVL", "MS", "MSFT", "MSTR", "MTDR", "MU", "MUD",
+    "MUR", "NCLH", "NEE", "NEM", "NET", "NFLX", "NGD", "NIO", "NKE", "NOC", "NOV", "NOW",
+    "NSC", "NTLA", "NVDA", "NVTS", "OKE", "ON", "ONON", "ORCL", "OVV", "OWL", "OXY", "PAAS",
+    "PANW", "PATH", "PBR", "PENN", "PEP", "PFE", "PG", "PH", "PINS", "PLD", "PLTD", "PM",
+    "PNC", "PR", "PRU", "PSA", "PSX", "PTEN", "PYPL", "QCOM", "QUBT", "RARE", "RBLX", "RCAT",
+    "RCL", "REGN", "RGTI", "RIOT", "RKT", "ROKU", "ROST", "RRC", "RSG", "RTX", "RUN", "SARO",
+    "SAVA", "SBLK", "SBUX", "SCHW", "SE", "SHOP", "SLB", "SM", "SNAP", "SNOW", "SNPS", "SO",
+    "SOC", "SPGI", "SPOT", "SRPT", "SSRM", "STNG", "SYK", "T", "TEAM", "TECK", "TEVA", "TFC",
+    "TGT", "TJX", "TMO", "TMUS", "TNK", "TRV", "TSLA", "TSLG", "TSM", "TTD", "TXN", "UAL",
+    "UBER", "UEC", "UNH", "UNP", "UPS", "UPST", "USB", "UUUU", "V", "VALE", "VFC", "VG",
+    "VLO", "VRT", "VRTX", "VZ", "WFC", "WFRD", "WM", "WMB", "WMT", "WPM", "WYNN", "XOM", "XP",
+    "XPEV", "ZIM", "ZM", "ZS", "ZTS",
+]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -228,41 +260,13 @@ def setup_logging():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
-    """Get S&P 500 + Nasdaq 100 symbols from Wikipedia."""
+    """Return hardcoded stock universe (307 stocks from S&P 500 + Nasdaq 100)."""
     report.start_step("get_universe")
-    sp500, ndx_syms = [], []
-
-    try:
-        sp500 = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        )[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        logger.info(f"  S&P 500: {len(sp500)} symbols from Wikipedia")
-    except Exception as e:
-        logger.warning(f"  S&P 500 scrape failed: {e}")
-        report.add_warning(f"S&P 500 scrape failed: {e}")
-
-    try:
-        ndx = pd.read_html(
-            "https://en.wikipedia.org/wiki/Nasdaq-100#Components"
-        )
-        for table in ndx:
-            if "Ticker" in table.columns:
-                ndx_syms = table["Ticker"].str.replace(".", "-", regex=False).tolist()
-                break
-            elif "Symbol" in table.columns:
-                ndx_syms = table["Symbol"].str.replace(".", "-", regex=False).tolist()
-                break
-        logger.info(f"  Nasdaq 100: {len(ndx_syms)} symbols from Wikipedia")
-    except Exception as e:
-        logger.warning(f"  Nasdaq 100 scrape failed: {e}")
-        report.add_warning(f"Nasdaq 100 scrape failed: {e}")
-
-    all_syms = sorted(set(sp500 + ndx_syms) - EXCLUDED_SYMBOLS)
-    logger.info(f"  Total universe: {len(all_syms)} unique symbols "
-                f"(excluded {len(EXCLUDED_SYMBOLS)} blacklisted)")
-    report.set("universe_size", len(all_syms))
+    symbols = [s for s in STOCK_UNIVERSE if s not in EXCLUDED_SYMBOLS]
+    logger.info(f"  Universe: {len(symbols)} stocks (hardcoded, excludes {len(EXCLUDED_SYMBOLS)} blacklisted)")
+    report.set("universe_size", len(symbols))
     report.end_step("get_universe")
-    return all_syms
+    return symbols
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
