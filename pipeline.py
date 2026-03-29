@@ -6,7 +6,7 @@ Runs once daily (triggered by cron):
 2. Compute features (62 stock + 22 macro = 84 total)
 3. Run LightGBM predictions → rank stocks
 4. Rebalance portfolio via Alpaca API (long top 20)
-5. Log results + send notification
+5. Log full run report
 
 Config: H5_LongOnly20 — 5-day horizon, long top 20, no shorts.
 Rebalances every 5 trading days.
@@ -24,6 +24,7 @@ import os
 import pickle
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -67,16 +68,148 @@ EXCLUDED_SYMBOLS = {
     "DNA", "GRAB", "NU", "RKLB", "VFS", "SMCI",
 }
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════
 
+class RunReport:
+    """Collects all run data for a final summary."""
+
+    def __init__(self):
+        self.start_time = datetime.now()
+        self.steps = {}
+        self.warnings = []
+        self.errors = []
+        self.timings = {}
+        self.data = {}
+
+    def start_step(self, name: str):
+        self.steps[name] = {"status": "running", "start": time.time()}
+
+    def end_step(self, name: str, status: str = "ok"):
+        if name in self.steps:
+            elapsed = time.time() - self.steps[name]["start"]
+            self.steps[name]["status"] = status
+            self.steps[name]["elapsed"] = elapsed
+            self.timings[name] = elapsed
+
+    def add_warning(self, msg: str):
+        self.warnings.append(msg)
+
+    def add_error(self, msg: str):
+        self.errors.append(msg)
+
+    def set(self, key: str, value):
+        self.data[key] = value
+
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+    def format_summary(self) -> str:
+        total_time = (datetime.now() - self.start_time).total_seconds()
+        lines = []
+        lines.append("")
+        lines.append("=" * 70)
+        lines.append("  RUN SUMMARY")
+        lines.append("=" * 70)
+        lines.append(f"  Date:         {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"  Total time:   {total_time:.1f}s")
+        lines.append("")
+
+        # Step timings
+        lines.append("  STEPS:")
+        for name, info in self.steps.items():
+            elapsed = info.get("elapsed", 0)
+            status = info["status"]
+            icon = "OK" if status == "ok" else "SKIP" if status == "skipped" else "FAIL"
+            lines.append(f"    [{icon:4s}] {name:30s} {elapsed:6.1f}s")
+        lines.append("")
+
+        # Data quality
+        if "universe_size" in self.data:
+            lines.append("  DATA:")
+            lines.append(f"    Universe requested:   {self.data.get('universe_size', '?')} symbols")
+            lines.append(f"    Stocks downloaded:    {self.data.get('stocks_downloaded', '?')} symbols")
+            lines.append(f"    Stocks failed:        {self.data.get('stocks_failed', '?')} symbols")
+            lines.append(f"    Macro downloaded:     {self.data.get('macro_downloaded', '?')}/{len(MACRO_TICKERS)} tickers")
+            lines.append(f"    Macro missing:        {', '.join(self.data.get('macro_missing', [])) or 'none'}")
+            lines.append(f"    Feature columns:      {self.data.get('n_features', '?')}")
+            lines.append(f"    Latest data date:     {self.data.get('latest_data_date', '?')}")
+            lines.append("")
+
+        # Predictions
+        if "n_predictions" in self.data:
+            lines.append("  PREDICTIONS:")
+            lines.append(f"    Stocks predicted:     {self.data.get('n_predictions', '?')}")
+            lines.append(f"    Prediction failures:  {self.data.get('prediction_failures', '?')}")
+            pred_range = self.data.get("prediction_range", {})
+            lines.append(f"    Pred range:           {pred_range.get('min', '?'):.2f}% to {pred_range.get('max', '?'):.2f}%")
+            lines.append(f"    Pred mean:            {pred_range.get('mean', '?'):.2f}%")
+            lines.append(f"    Pred std:             {pred_range.get('std', '?'):.2f}%")
+            lines.append("")
+
+        # Portfolio
+        if "target_portfolio" in self.data:
+            lines.append("  TARGET PORTFOLIO (top 20):")
+            for i, (sym, pred) in enumerate(self.data["target_portfolio"]):
+                lines.append(f"    {i+1:2d}. {sym:6s}  {pred:+6.2f}%")
+            lines.append("")
+
+        # Rebalance
+        if "rebalance" in self.data:
+            rb = self.data["rebalance"]
+            lines.append("  REBALANCE:")
+            lines.append(f"    Mode:                 {'DRY RUN' if rb.get('dry_run') else 'LIVE'}")
+            lines.append(f"    Portfolio value:       ${rb.get('portfolio_value', 0):,.2f}")
+            lines.append(f"    Cash available:        ${rb.get('cash', 0):,.2f}")
+            lines.append(f"    Target weight/stock:   ${rb.get('target_weight', 0):,.2f}")
+            lines.append(f"    Positions before:      {rb.get('positions_before', '?')}")
+            lines.append(f"    Sells (exit):          {rb.get('n_sells', 0)}")
+            lines.append(f"    Buys (new):            {rb.get('n_buys', 0)}")
+            lines.append(f"    Rebalanced (adjust):   {rb.get('n_rebalanced', 0)}")
+            lines.append(f"    Held (no change):      {rb.get('n_held', 0)}")
+            lines.append(f"    Turnover:              {rb.get('turnover', 0):.0%}")
+            if not rb.get("dry_run"):
+                lines.append(f"    Orders executed:       {rb.get('executed', 0)}")
+                lines.append(f"    Orders failed:         {rb.get('failed', 0)}")
+
+            # Detail sold/bought
+            if rb.get("sells_detail"):
+                lines.append(f"    Sold:   {', '.join(rb['sells_detail'])}")
+            if rb.get("buys_detail"):
+                lines.append(f"    Bought: {', '.join(rb['buys_detail'])}")
+            lines.append("")
+
+        # Warnings / Errors
+        if self.warnings:
+            lines.append(f"  WARNINGS ({len(self.warnings)}):")
+            for w in self.warnings[:20]:
+                lines.append(f"    - {w}")
+            if len(self.warnings) > 20:
+                lines.append(f"    ... and {len(self.warnings) - 20} more")
+            lines.append("")
+
+        if self.errors:
+            lines.append(f"  ERRORS ({len(self.errors)}):")
+            for e in self.errors[:20]:
+                lines.append(f"    - {e}")
+            lines.append("")
+
+        # Final status
+        status = "SUCCESS" if not self.errors else "COMPLETED WITH ERRORS"
+        lines.append(f"  STATUS: {status}")
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+
 def setup_logging():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOG_DIR / f"pipeline_{datetime.now().strftime('%Y%m%d')}.log"
+    log_file = LOG_DIR / f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
     fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     handlers = [logging.StreamHandler(), logging.FileHandler(log_file)]
     for h in handlers:
@@ -87,21 +220,26 @@ def setup_logging():
     for h in handlers:
         logger.addHandler(h)
 
-    return logging.getLogger("pipeline")
+    return logging.getLogger("pipeline"), log_file
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DATA DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════
 
-def get_tradeable_symbols() -> list[str]:
+def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
     """Get S&P 500 + Nasdaq 100 symbols from Wikipedia."""
+    report.start_step("get_universe")
+    sp500, ndx_syms = [], []
+
     try:
         sp500 = pd.read_html(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         )[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-    except Exception:
-        sp500 = []
+        logger.info(f"  S&P 500: {len(sp500)} symbols from Wikipedia")
+    except Exception as e:
+        logger.warning(f"  S&P 500 scrape failed: {e}")
+        report.add_warning(f"S&P 500 scrape failed: {e}")
 
     try:
         ndx = pd.read_html(
@@ -114,12 +252,16 @@ def get_tradeable_symbols() -> list[str]:
             elif "Symbol" in table.columns:
                 ndx_syms = table["Symbol"].str.replace(".", "-", regex=False).tolist()
                 break
-        else:
-            ndx_syms = []
-    except Exception:
-        ndx_syms = []
+        logger.info(f"  Nasdaq 100: {len(ndx_syms)} symbols from Wikipedia")
+    except Exception as e:
+        logger.warning(f"  Nasdaq 100 scrape failed: {e}")
+        report.add_warning(f"Nasdaq 100 scrape failed: {e}")
 
     all_syms = sorted(set(sp500 + ndx_syms) - EXCLUDED_SYMBOLS)
+    logger.info(f"  Total universe: {len(all_syms)} unique symbols "
+                f"(excluded {len(EXCLUDED_SYMBOLS)} blacklisted)")
+    report.set("universe_size", len(all_syms))
+    report.end_step("get_universe")
     return all_syms
 
 
@@ -131,18 +273,27 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def download_bars(symbols: list[str], days: int, logger) -> dict[str, pd.DataFrame]:
+def download_bars(symbols: list[str], days: int, logger,
+                  report: RunReport) -> dict[str, pd.DataFrame]:
     """Download recent daily bars from Yahoo Finance."""
+    report.start_step("download_stocks")
     end = datetime.now()
-    start = end - timedelta(days=int(days * 1.5))  # Extra buffer for weekends/holidays
+    start = end - timedelta(days=int(days * 1.5))
 
-    logger.info(f"Downloading {len(symbols)} symbols ({start.date()} → {end.date()})...")
+    logger.info(f"  Date range: {start.date()} → {end.date()}")
+    logger.info(f"  Symbols to download: {len(symbols)}")
 
     data = {}
+    failed_syms = []
     batch_size = 50
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
+    n_batches = (len(symbols) + batch_size - 1) // batch_size
+
+    for batch_idx in range(0, len(symbols), batch_size):
+        batch_num = batch_idx // batch_size + 1
+        batch = symbols[batch_idx:batch_idx + batch_size]
         tickers_str = " ".join(batch)
+        batch_start = time.time()
+
         try:
             df = yf.download(
                 tickers_str, start=start.strftime("%Y-%m-%d"),
@@ -150,6 +301,7 @@ def download_bars(symbols: list[str], days: int, logger) -> dict[str, pd.DataFra
                 group_by="ticker", auto_adjust=True, progress=False,
                 threads=True,
             )
+            batch_ok = 0
             for sym in batch:
                 try:
                     if len(batch) == 1:
@@ -160,22 +312,50 @@ def download_bars(symbols: list[str], days: int, logger) -> dict[str, pd.DataFra
                     sym_df = sym_df.dropna(subset=["close"])
                     if len(sym_df) >= MIN_HISTORY_DAYS:
                         data[sym] = sym_df
+                        batch_ok += 1
+                    else:
+                        failed_syms.append(sym)
                 except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"Batch download failed: {e}")
-        time.sleep(0.3)  # Rate limit
+                    failed_syms.append(sym)
 
-    logger.info(f"Downloaded {len(data)} symbols with >= {MIN_HISTORY_DAYS} days")
+            batch_time = time.time() - batch_start
+            logger.info(f"  Batch {batch_num}/{n_batches}: "
+                        f"{batch_ok}/{len(batch)} ok ({batch_time:.1f}s)")
+
+        except Exception as e:
+            logger.warning(f"  Batch {batch_num}/{n_batches} FAILED: {e}")
+            report.add_warning(f"Stock batch {batch_num} failed: {e}")
+            failed_syms.extend(batch)
+
+        time.sleep(0.3)
+
+    logger.info(f"  Downloaded: {len(data)} symbols, "
+                f"failed: {len(failed_syms)} symbols")
+
+    if data:
+        sample_sym = next(iter(data))
+        sample_df = data[sample_sym]
+        logger.info(f"  Sample ({sample_sym}): {len(sample_df)} days, "
+                    f"{sample_df.index[0].date()} → {sample_df.index[-1].date()}")
+        report.set("latest_data_date", str(sample_df.index[-1].date()))
+
+    report.set("stocks_downloaded", len(data))
+    report.set("stocks_failed", len(failed_syms))
+    if failed_syms and len(failed_syms) <= 20:
+        report.add_warning(f"Failed stocks: {', '.join(failed_syms)}")
+    report.end_step("download_stocks")
     return data
 
 
-def download_macro(days: int, logger) -> dict[str, pd.DataFrame]:
+def download_macro(days: int, logger, report: RunReport) -> dict[str, pd.DataFrame]:
     """Download macro tickers."""
+    report.start_step("download_macro")
     end = datetime.now()
     start = end - timedelta(days=int(days * 1.5))
 
     macro = {}
+    missing = []
+
     for ticker in MACRO_TICKERS:
         try:
             df = yf.download(
@@ -185,12 +365,27 @@ def download_macro(days: int, logger) -> dict[str, pd.DataFrame]:
             )
             df = _normalize_columns(df)
             name = MACRO_RENAME.get(ticker, ticker)
-            macro[name] = df.dropna(subset=["close"])
+            df_clean = df.dropna(subset=["close"])
+            if len(df_clean) > 0:
+                macro[name] = df_clean
+                logger.info(f"  {name:6s}: {len(df_clean)} days, "
+                            f"latest close: {df_clean['close'].iloc[-1]:.2f}")
+            else:
+                missing.append(ticker)
+                logger.warning(f"  {ticker}: no data returned")
         except Exception as e:
-            logger.warning(f"Macro {ticker} failed: {e}")
+            missing.append(ticker)
+            logger.warning(f"  {ticker}: FAILED — {e}")
+            report.add_warning(f"Macro {ticker} failed: {e}")
         time.sleep(0.1)
 
-    logger.info(f"Downloaded {len(macro)} macro tickers")
+    logger.info(f"  Macro: {len(macro)}/{len(MACRO_TICKERS)} downloaded")
+    if missing:
+        logger.warning(f"  Missing: {', '.join(missing)}")
+
+    report.set("macro_downloaded", len(macro))
+    report.set("macro_missing", missing)
+    report.end_step("download_macro")
     return macro
 
 
@@ -377,10 +572,12 @@ def compute_macro_features(macro_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 def predict_rankings(
     stock_data: dict, macro_features: pd.DataFrame,
-    model, feature_cols: list, logger,
+    model, feature_cols: list, logger, report: RunReport,
 ) -> list[tuple[str, float]]:
     """Generate predictions for all stocks, return sorted rankings."""
+    report.start_step("predict")
     predictions = {}
+    failures = []
 
     for sym, df in stock_data.items():
         try:
@@ -399,11 +596,11 @@ def predict_rankings(
             avail_cols = [c for c in feature_cols if c in merged.columns]
 
             if len(avail_cols) < len(feature_cols) * 0.9:
-                continue  # Too many missing features
+                failures.append((sym, "too many missing features"))
+                continue
 
             row = latest[avail_cols]
             if row.isna().any(axis=1).iloc[0]:
-                # Fill remaining NaN with 0 (same as training)
                 row = row.fillna(0)
 
             # Ensure column order matches training
@@ -415,17 +612,42 @@ def predict_rankings(
             pred = model.predict(row)[0]
             if np.isfinite(pred):
                 predictions[sym] = float(pred)
+            else:
+                failures.append((sym, "non-finite prediction"))
 
         except Exception as e:
-            logger.debug(f"Prediction failed for {sym}: {e}")
+            failures.append((sym, str(e)))
 
     ranked = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
-    logger.info(f"Generated predictions for {len(ranked)} stocks")
+
+    logger.info(f"  Predictions: {len(ranked)} ok, {len(failures)} failed")
+    if failures and len(failures) <= 10:
+        for sym, reason in failures:
+            logger.info(f"    SKIP {sym}: {reason}")
+
+    # Prediction distribution stats
+    if predictions:
+        preds_arr = np.array(list(predictions.values()))
+        report.set("prediction_range", {
+            "min": float(np.min(preds_arr)),
+            "max": float(np.max(preds_arr)),
+            "mean": float(np.mean(preds_arr)),
+            "std": float(np.std(preds_arr)),
+            "median": float(np.median(preds_arr)),
+        })
+        logger.info(f"  Prediction range: {np.min(preds_arr):.2f}% to "
+                    f"{np.max(preds_arr):.2f}% "
+                    f"(mean: {np.mean(preds_arr):.2f}%, "
+                    f"std: {np.std(preds_arr):.2f}%)")
+
+    report.set("n_predictions", len(ranked))
+    report.set("prediction_failures", len(failures))
 
     if ranked:
-        logger.info(f"Top 5: {[(s, f'{p:.2f}') for s, p in ranked[:5]]}")
-        logger.info(f"Bottom 5: {[(s, f'{p:.2f}') for s, p in ranked[-5:]]}")
+        logger.info(f"  Top 5:    {[(s, f'{p:+.2f}%') for s, p in ranked[:5]]}")
+        logger.info(f"  Bottom 5: {[(s, f'{p:+.2f}%') for s, p in ranked[-5:]]}")
 
+    report.end_step("predict")
     return ranked
 
 
@@ -441,11 +663,14 @@ def get_alpaca_headers():
     }
 
 
-def alpaca_request(method: str, endpoint: str, data=None):
-    """Make an Alpaca API request."""
+def alpaca_request(method: str, endpoint: str, data=None, logger=None):
+    """Make an Alpaca API request with logging."""
     import requests
     url = f"{ALPACA_BASE_URL}/{endpoint}"
     headers = get_alpaca_headers()
+
+    if logger:
+        logger.info(f"    API: {method} {endpoint}")
 
     if method == "GET":
         resp = requests.get(url, headers=headers)
@@ -457,112 +682,189 @@ def alpaca_request(method: str, endpoint: str, data=None):
         raise ValueError(f"Unknown method: {method}")
 
     if resp.status_code not in (200, 204, 207):
-        raise Exception(f"Alpaca {method} {endpoint} failed: {resp.status_code} {resp.text}")
+        err_msg = f"Alpaca {method} {endpoint}: {resp.status_code} {resp.text}"
+        if logger:
+            logger.error(f"    {err_msg}")
+        raise Exception(err_msg)
 
     if resp.status_code == 204:
         return {}
     return resp.json()
 
 
-def get_account(logger):
+def get_account(logger, report: RunReport):
     """Get Alpaca account info."""
-    acct = alpaca_request("GET", "v2/account")
-    logger.info(f"Account: ${float(acct['portfolio_value']):,.2f} "
-                f"(cash: ${float(acct['cash']):,.2f}, "
-                f"buying_power: ${float(acct['buying_power']):,.2f})")
+    acct = alpaca_request("GET", "v2/account", logger=logger)
+    pv = float(acct["portfolio_value"])
+    cash = float(acct["cash"])
+    bp = float(acct["buying_power"])
+    logger.info(f"  Account: portfolio=${pv:,.2f}, "
+                f"cash=${cash:,.2f}, buying_power=${bp:,.2f}")
+    report.data.setdefault("rebalance", {}).update({
+        "portfolio_value": pv, "cash": cash, "buying_power": bp,
+    })
     return acct
 
 
 def get_positions(logger) -> dict[str, dict]:
-    """Get current positions."""
-    positions = alpaca_request("GET", "v2/positions")
+    """Get current positions with details."""
+    positions = alpaca_request("GET", "v2/positions", logger=logger)
     pos_dict = {}
+    total_value = 0
+    total_pl = 0
+
     for p in positions:
+        mv = float(p["market_value"])
+        pl = float(p["unrealized_pl"])
         pos_dict[p["symbol"]] = {
             "qty": float(p["qty"]),
-            "market_value": float(p["market_value"]),
-            "unrealized_pl": float(p["unrealized_pl"]),
+            "market_value": mv,
+            "unrealized_pl": pl,
+            "unrealized_pl_pct": float(p.get("unrealized_plpc", 0)) * 100,
+            "avg_entry": float(p.get("avg_entry_price", 0)),
+            "current_price": float(p.get("current_price", 0)),
             "side": p["side"],
         }
-    logger.info(f"Current positions: {len(pos_dict)} stocks")
+        total_value += mv
+        total_pl += pl
+
+    logger.info(f"  Current positions: {len(pos_dict)} stocks, "
+                f"value=${total_value:,.2f}, unrealized P&L=${total_pl:,.2f}")
+
+    if pos_dict:
+        # Show each position
+        for sym, info in sorted(pos_dict.items()):
+            logger.info(f"    {sym:6s}: {info['qty']:>8.2f} shares, "
+                        f"${info['market_value']:>10,.2f}, "
+                        f"P&L: ${info['unrealized_pl']:>+8,.2f} "
+                        f"({info['unrealized_pl_pct']:>+5.1f}%)")
+
     return pos_dict
 
 
 def rebalance_portfolio(
-    target_symbols: list[str], logger, dry_run: bool = False,
+    target_symbols: list[str], logger, report: RunReport,
+    dry_run: bool = False,
 ):
     """Rebalance to equal-weight long portfolio of target symbols."""
-    acct = get_account(logger)
+    report.start_step("rebalance")
+    rb_data = report.data.setdefault("rebalance", {})
+    rb_data["dry_run"] = dry_run
+
+    acct = get_account(logger, report)
     portfolio_value = float(acct["portfolio_value"])
     current_positions = get_positions(logger)
+    rb_data["positions_before"] = len(current_positions)
 
     target_set = set(target_symbols)
     current_set = set(current_positions.keys())
 
-    to_sell = current_set - target_set
-    to_buy = target_set - current_set
-    to_hold = current_set & target_set
+    to_sell = sorted(current_set - target_set)
+    to_buy = sorted(target_set - current_set)
+    to_hold = sorted(current_set & target_set)
 
     target_weight = portfolio_value / len(target_symbols)
+    rb_data["target_weight"] = target_weight
+
     orders = []
+    n_rebalanced = 0
+    n_held_unchanged = 0
 
     # 1. Sell positions not in target
+    logger.info(f"\n  Sells ({len(to_sell)} positions to exit):")
     for sym in to_sell:
         qty = current_positions[sym]["qty"]
-        logger.info(f"  SELL {sym}: {qty} shares (not in target)")
+        mv = current_positions[sym]["market_value"]
+        pl = current_positions[sym]["unrealized_pl"]
+        logger.info(f"    SELL {sym}: {qty:.2f} shares, "
+                    f"${mv:,.2f}, P&L: ${pl:+,.2f}")
         if not dry_run:
             orders.append(("sell", sym, qty))
 
-    # 2. Rebalance existing positions
+    # 2. Check held positions — rebalance if needed
+    logger.info(f"\n  Holds ({len(to_hold)} positions to check):")
     for sym in to_hold:
         current_value = current_positions[sym]["market_value"]
         diff = target_weight - current_value
-        if abs(diff) > target_weight * 0.1:  # Only rebalance if >10% off target
-            logger.info(f"  REBALANCE {sym}: current ${current_value:,.0f} → target ${target_weight:,.0f}")
+        drift_pct = abs(diff) / target_weight * 100
+
+        if abs(diff) > target_weight * 0.1:
+            direction = "BUY more" if diff > 0 else "TRIM"
+            logger.info(f"    REBALANCE {sym}: ${current_value:,.0f} → "
+                        f"${target_weight:,.0f} (drift: {drift_pct:.0f}%, {direction} ${abs(diff):,.0f})")
+            n_rebalanced += 1
             if not dry_run:
                 if diff > 0:
                     orders.append(("buy_notional", sym, diff))
                 else:
                     orders.append(("sell_notional", sym, abs(diff)))
+        else:
+            logger.info(f"    HOLD {sym}: ${current_value:,.0f} "
+                        f"(drift: {drift_pct:.0f}%, within 10% — no action)")
+            n_held_unchanged += 1
 
     # 3. Buy new positions
+    logger.info(f"\n  Buys ({len(to_buy)} new positions):")
     for sym in to_buy:
-        logger.info(f"  BUY {sym}: ${target_weight:,.0f} (new position)")
+        logger.info(f"    BUY {sym}: ${target_weight:,.0f} (new position)")
         if not dry_run:
             orders.append(("buy_notional", sym, target_weight))
 
+    # Turnover calculation
+    total_positions = max(len(target_set) + len(current_set), 1)
+    turnover = (len(to_sell) + len(to_buy)) / total_positions
+
+    rb_data.update({
+        "n_sells": len(to_sell), "n_buys": len(to_buy),
+        "n_rebalanced": n_rebalanced, "n_held": n_held_unchanged,
+        "sells_detail": to_sell, "buys_detail": to_buy,
+        "turnover": turnover,
+    })
+
+    logger.info(f"\n  Summary: {len(to_sell)} sells, {len(to_buy)} buys, "
+                f"{n_rebalanced} rebalanced, {n_held_unchanged} held, "
+                f"turnover: {turnover:.0%}")
+
     if dry_run:
-        logger.info(f"DRY RUN — would execute {len(to_sell)} sells, "
-                     f"{len(to_buy)} buys, {len(to_hold)} holds")
-        return {"sells": len(to_sell), "buys": len(to_buy), "holds": len(to_hold)}
+        logger.info("  MODE: DRY RUN — no orders sent")
+        report.end_step("rebalance")
+        return rb_data
 
     # Execute orders
+    logger.info(f"\n  Executing {len(orders)} orders...")
     executed = 0
     failed = 0
 
-    # Execute sells first (free up capital)
     for action, sym, amount in orders:
         try:
             if action == "sell":
-                alpaca_request("DELETE", f"v2/positions/{sym}")
+                alpaca_request("DELETE", f"v2/positions/{sym}", logger=logger)
+                logger.info(f"    OK: closed {sym}")
             elif action == "buy_notional":
-                alpaca_request("POST", "v2/orders", {
+                resp = alpaca_request("POST", "v2/orders", {
                     "symbol": sym, "notional": round(amount, 2),
                     "side": "buy", "type": "market", "time_in_force": "day",
-                })
+                }, logger=logger)
+                logger.info(f"    OK: buy {sym} ${amount:,.2f} "
+                            f"(order: {resp.get('id', '?')})")
             elif action == "sell_notional":
-                alpaca_request("POST", "v2/orders", {
+                resp = alpaca_request("POST", "v2/orders", {
                     "symbol": sym, "notional": round(amount, 2),
                     "side": "sell", "type": "market", "time_in_force": "day",
-                })
+                }, logger=logger)
+                logger.info(f"    OK: sell {sym} ${amount:,.2f} "
+                            f"(order: {resp.get('id', '?')})")
             executed += 1
-            time.sleep(0.1)  # Rate limit
+            time.sleep(0.1)
         except Exception as e:
-            logger.error(f"Order failed for {sym}: {e}")
+            logger.error(f"    FAIL: {action} {sym} — {e}")
+            report.add_error(f"Order failed: {action} {sym} — {e}")
             failed += 1
 
-    logger.info(f"Orders: {executed} executed, {failed} failed")
-    return {"executed": executed, "failed": failed}
+    rb_data.update({"executed": executed, "failed": failed})
+    logger.info(f"  Orders done: {executed} executed, {failed} failed")
+    report.end_step("rebalance")
+    return rb_data
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -601,91 +903,152 @@ def should_rebalance(state: dict, force: bool = False) -> bool:
 
 def run_pipeline(dry_run: bool = False, force: bool = False):
     """Execute the full daily pipeline."""
-    logger = setup_logging()
-    logger.info("=" * 60)
-    logger.info(f"ML Trading Pipeline — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"Config: H{HORIZON}_LongOnly{TOP_N}, dry_run={dry_run}")
-    logger.info("=" * 60)
+    logger, log_file = setup_logging()
+    report = RunReport()
+
+    logger.info("=" * 70)
+    logger.info(f"  ML TRADING PIPELINE")
+    logger.info(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"  Config: H{HORIZON}_LongOnly{TOP_N}")
+    logger.info(f"  Mode: {'DRY RUN' if dry_run else 'LIVE PAPER TRADING'}")
+    logger.info(f"  Force rebalance: {force}")
+    logger.info(f"  Log: {log_file}")
+    logger.info("=" * 70)
 
     # Check API keys
     if not dry_run and (not ALPACA_API_KEY or not ALPACA_SECRET_KEY):
-        logger.error("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set")
+        logger.error("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set!")
+        report.add_error("Missing API keys")
+        logger.info(report.format_summary())
         sys.exit(1)
 
-    # Load model
-    logger.info("\n1. Loading model...")
+    # ── Step 1: Load model ──
+    logger.info("\n[1/5] LOADING MODEL")
+    report.start_step("load_model")
     if not MODEL_PATH.exists():
-        logger.error(f"Model not found at {MODEL_PATH}")
+        logger.error(f"Model not found: {MODEL_PATH}")
+        report.add_error(f"Model not found: {MODEL_PATH}")
+        logger.info(report.format_summary())
         sys.exit(1)
 
     model_bundle = pickle.load(open(MODEL_PATH, "rb"))
     model = model_bundle["model"]
     feature_cols = model_bundle["feature_cols"]
-    logger.info(f"Model loaded: {len(feature_cols)} features, "
-                f"horizon={model_bundle['horizon']}d")
+    logger.info(f"  Model: {len(feature_cols)} features, "
+                f"horizon={model_bundle['horizon']}d, "
+                f"task={model_bundle.get('task', '?')}")
+    logger.info(f"  Trained: {model_bundle.get('saved_at', '?')}")
+    report.set("n_features", len(feature_cols))
+    report.end_step("load_model")
 
-    # Check state
+    # ── Step 2: Check state ──
     state = load_state()
+    logger.info(f"\n  State: run #{state.get('run_count', 0) + 1}, "
+                f"last rebalance: {state.get('last_rebalance', 'never')}")
+
     if not should_rebalance(state, force):
-        logger.info(f"Not rebalancing today (last: {state['last_rebalance']}, "
-                     f"next in {HORIZON - (datetime.now() - datetime.fromisoformat(state['last_rebalance'])).days}d)")
+        last = datetime.fromisoformat(state["last_rebalance"])
+        days_since = (datetime.now() - last).days
+        days_until = HORIZON - days_since
+        logger.info(f"  Skipping — last rebalance {days_since}d ago, "
+                     f"next in {days_until}d")
         state["last_run"] = datetime.now().isoformat()
         save_state(state)
+        report.end_step("load_model")
+        logger.info(report.format_summary())
         return
 
-    # Download data
-    logger.info("\n2. Downloading market data...")
-    symbols = get_tradeable_symbols()
-    logger.info(f"Universe: {len(symbols)} symbols")
+    # ── Step 3: Download data ──
+    logger.info("\n[2/5] DOWNLOADING MARKET DATA")
+    symbols = get_tradeable_symbols(logger, report)
 
-    stock_data = download_bars(symbols, LOOKBACK_DAYS, logger)
-    macro_data = download_macro(LOOKBACK_DAYS, logger)
+    if not symbols:
+        logger.error("No symbols found — cannot proceed")
+        report.add_error("Universe is empty")
+        logger.info(report.format_summary())
+        sys.exit(1)
 
-    # Compute features
-    logger.info("\n3. Computing features...")
+    stock_data = download_bars(symbols, LOOKBACK_DAYS, logger, report)
+    macro_data = download_macro(LOOKBACK_DAYS, logger, report)
+
+    if not stock_data:
+        logger.error("No stock data downloaded — cannot proceed")
+        report.add_error("No stock data available")
+        logger.info(report.format_summary())
+        sys.exit(1)
+
+    # ── Step 4: Compute features ──
+    logger.info("\n[3/5] COMPUTING FEATURES")
+    report.start_step("compute_features")
     macro_features = compute_macro_features(macro_data)
-    logger.info(f"Macro features: {len(macro_features.columns)} columns, "
+    logger.info(f"  Macro features: {len(macro_features.columns)} columns, "
                 f"{len(macro_features)} days")
 
-    # Generate predictions
-    logger.info("\n4. Generating predictions...")
-    rankings = predict_rankings(stock_data, macro_features, model, feature_cols, logger)
+    # Log latest macro values for context
+    if not macro_features.empty:
+        latest_macro = macro_features.iloc[-1]
+        logger.info("  Latest macro snapshot:")
+        for col in sorted(macro_features.columns):
+            val = latest_macro[col]
+            if np.isfinite(val):
+                logger.info(f"    {col:25s}: {val:>10.3f}")
+    report.end_step("compute_features")
+
+    # ── Step 5: Generate predictions ──
+    logger.info("\n[4/5] GENERATING PREDICTIONS")
+    rankings = predict_rankings(
+        stock_data, macro_features, model, feature_cols, logger, report,
+    )
 
     if len(rankings) < TOP_N:
         logger.error(f"Only {len(rankings)} predictions — need at least {TOP_N}")
+        report.add_error(f"Insufficient predictions: {len(rankings)} < {TOP_N}")
+        logger.info(report.format_summary())
         sys.exit(1)
 
     target_symbols = [sym for sym, _ in rankings[:TOP_N]]
-    logger.info(f"\nTarget portfolio ({TOP_N} stocks):")
+    report.set("target_portfolio", rankings[:TOP_N])
+
+    logger.info(f"\n  Target portfolio ({TOP_N} stocks):")
     for i, (sym, pred) in enumerate(rankings[:TOP_N]):
-        logger.info(f"  {i+1:2d}. {sym:6s}  predicted return: {pred:+.2f}%")
+        logger.info(f"    {i+1:2d}. {sym:6s}  {pred:+6.2f}%")
 
-    # Rebalance
-    logger.info("\n5. Rebalancing portfolio...")
-    result = rebalance_portfolio(target_symbols, logger, dry_run=dry_run)
+    # ── Step 6: Rebalance ──
+    logger.info("\n[5/5] REBALANCING PORTFOLIO")
+    result = rebalance_portfolio(target_symbols, logger, report, dry_run=dry_run)
 
-    # Update state
+    # ── Save state ──
     state["last_rebalance"] = datetime.now().isoformat()
     state["last_run"] = datetime.now().isoformat()
     state["run_count"] = state.get("run_count", 0) + 1
     state["history"].append({
         "date": datetime.now().isoformat(),
         "target_symbols": target_symbols,
-        "predictions": {s: p for s, p in rankings[:TOP_N]},
-        "result": result,
+        "predictions": {s: round(p, 4) for s, p in rankings[:TOP_N]},
+        "result": {k: v for k, v in result.items()
+                   if k not in ("sells_detail", "buys_detail")},
     })
-    # Keep last 100 entries
     state["history"] = state["history"][-100:]
     save_state(state)
 
-    logger.info(f"\nPipeline complete! Run #{state['run_count']}")
-    logger.info("=" * 60)
+    # ── Final summary ──
+    summary = report.format_summary()
+    logger.info(summary)
+    logger.info(f"Log saved to: {log_file}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ML Trading Pipeline")
-    parser.add_argument("--dry-run", action="store_true", help="Predict only, no orders")
-    parser.add_argument("--force", action="store_true", help="Force rebalance")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Predict only, no orders")
+    parser.add_argument("--force", action="store_true",
+                        help="Force rebalance even if not due")
     args = parser.parse_args()
 
-    run_pipeline(dry_run=args.dry_run, force=args.force)
+    try:
+        run_pipeline(dry_run=args.dry_run, force=args.force)
+    except Exception as e:
+        logging.getLogger("pipeline").error(
+            f"FATAL: {e}\n{traceback.format_exc()}"
+        )
+        sys.exit(1)

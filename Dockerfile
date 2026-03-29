@@ -13,10 +13,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app
 COPY pipeline.py .
+COPY dashboard.py .
 COPY model/ model/
 
 # Create dirs for state and logs
 RUN mkdir -p state logs
 
-# Default: run pipeline
-CMD ["python", "pipeline.py"]
+# Expose web port
+EXPOSE 8080
+
+# Run dashboard (includes scheduler + web UI)
+CMD ["python", "dashboard.py"]
