@@ -43,7 +43,10 @@ MIN_HISTORY_DAYS = 250  # Minimum days of history needed for features
 LOOKBACK_DAYS = 300     # Days of history to download for feature computation
 
 # Alpaca
-ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+# Fix common typo: ensure URL starts with https://
+if ALPACA_BASE_URL and not ALPACA_BASE_URL.startswith("http"):
+    ALPACA_BASE_URL = "https://" + ALPACA_BASE_URL.lstrip("htps:/")
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 
@@ -755,10 +758,20 @@ def rebalance_portfolio(
     rb_data = report.data.setdefault("rebalance", {})
     rb_data["dry_run"] = dry_run
 
-    acct = get_account(logger, report)
-    portfolio_value = float(acct["portfolio_value"])
-    current_positions = get_positions(logger)
-    rb_data["positions_before"] = len(current_positions)
+    if dry_run:
+        # In dry-run mode, use mock account data so we don't need Alpaca credentials
+        logger.info("  DRY RUN: using mock account (portfolio=$100,000)")
+        portfolio_value = 100_000.0
+        current_positions = {}
+        rb_data["portfolio_value"] = portfolio_value
+        rb_data["cash"] = portfolio_value
+        rb_data["buying_power"] = portfolio_value
+        rb_data["positions_before"] = 0
+    else:
+        acct = get_account(logger, report)
+        portfolio_value = float(acct["portfolio_value"])
+        current_positions = get_positions(logger)
+        rb_data["positions_before"] = len(current_positions)
 
     target_set = set(target_symbols)
     current_set = set(current_positions.keys())
