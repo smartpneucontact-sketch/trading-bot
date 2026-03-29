@@ -16,8 +16,9 @@ COPY pipeline.py .
 COPY dashboard.py .
 COPY model/ model/
 
-# Create dirs for state and logs
-RUN mkdir -p state logs
+# Create persistent data directory (mount a Railway volume here)
+RUN mkdir -p /app/data/state /app/data/logs
+ENV DATA_DIR=/app/data
 
 # Expose web port
 EXPOSE 8080

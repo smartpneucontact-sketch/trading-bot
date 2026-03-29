@@ -53,8 +53,11 @@ ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 # Paths
 BASE_DIR = Path(__file__).parent
 MODEL_PATH = BASE_DIR / "model" / "ml_v4_model.pkl"
-STATE_PATH = BASE_DIR / "state" / "pipeline_state.json"
-LOG_DIR = BASE_DIR / "logs"
+
+# Persistent data directory — mount a Railway volume at /app/data to survive redeploys
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data")))
+STATE_PATH = DATA_DIR / "state" / "pipeline_state.json"
+LOG_DIR = DATA_DIR / "logs"
 
 # Macro tickers needed for features
 MACRO_TICKERS = [

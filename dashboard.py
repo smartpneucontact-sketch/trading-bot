@@ -36,8 +36,15 @@ import pipeline
 PORT = int(os.environ.get("PORT", 8080))
 TZ = os.environ.get("TZ", "America/New_York")
 BASE_DIR = Path(__file__).parent
-STATE_PATH = BASE_DIR / "state" / "pipeline_state.json"
-LOG_DIR = BASE_DIR / "logs"
+
+# Persistent data directory — mount a Railway volume at /app/data to survive redeploys
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data")))
+STATE_PATH = DATA_DIR / "state" / "pipeline_state.json"
+LOG_DIR = DATA_DIR / "logs"
+
+# Ensure directories exist
+STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory store for live status
 bot_status = {
