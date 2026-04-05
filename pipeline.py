@@ -83,7 +83,7 @@ class ModelConfig:
     """Configuration for a single model instance."""
     name: str                   # e.g. "v4", "v5"
     model_path: Path            # path to model.pkl
-    feature_version: str        # "v4" or "v5"
+    feature_version: str        # "v4", "v5", or "v6"
     alpaca_key: str             # per-model Alpaca API key
     alpaca_secret: str          # per-model Alpaca API secret
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
@@ -132,6 +132,20 @@ def get_active_models() -> list[ModelConfig]:
             feature_version="v5",
             alpaca_key=v5_key,
             alpaca_secret=v5_secret,
+        ))
+
+    # v6 model
+    v6_key = os.environ.get("MODEL_V6_ALPACA_KEY", "")
+    v6_secret = os.environ.get("MODEL_V6_ALPACA_SECRET", "")
+    v6_model_path = BASE_DIR / "model" / "v6" / "model.pkl"
+
+    if v6_key and v6_secret and v6_model_path.exists():
+        models.append(ModelConfig(
+            name="v6",
+            model_path=v6_model_path,
+            feature_version="v6",
+            alpaca_key=v6_key,
+            alpaca_secret=v6_secret,
         ))
 
     return models
@@ -406,9 +420,13 @@ def setup_logging(model_name: str = "main"):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
-    """Get S&P 500 + Nasdaq 100 symbols from Wikipedia."""
+    """Get S&P 500 + Nasdaq 100 + Russell 1000 symbols from Wikipedia.
+
+    Expanded universe (~900-1000 unique stocks) for better alpha discovery,
+    especially in mid-caps where analyst coverage is thinner.
+    """
     report.start_step("get_universe")
-    sp500, ndx_syms = [], []
+    sp500, ndx_syms, russell_syms = [], [], []
 
     try:
         sp500 = pd.read_html(
@@ -435,7 +453,24 @@ def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
         logger.warning(f"  Nasdaq 100 scrape failed: {e}")
         report.add_warning(f"Nasdaq 100 scrape failed: {e}")
 
-    all_syms = sorted(set(sp500 + ndx_syms) - EXCLUDED_SYMBOLS)
+    # Russell 1000 — adds ~400-500 mid-cap stocks not in S&P 500
+    try:
+        r1k_tables = pd.read_html(
+            "https://en.wikipedia.org/wiki/Russell_1000_Index"
+        )
+        for table in r1k_tables:
+            if "Ticker" in table.columns:
+                russell_syms = table["Ticker"].str.replace(".", "-", regex=False).tolist()
+                break
+            elif "Symbol" in table.columns:
+                russell_syms = table["Symbol"].str.replace(".", "-", regex=False).tolist()
+                break
+        logger.info(f"  Russell 1000: {len(russell_syms)} symbols from Wikipedia")
+    except Exception as e:
+        logger.warning(f"  Russell 1000 scrape failed (non-critical): {e}")
+        report.add_warning(f"Russell 1000 scrape failed: {e}")
+
+    all_syms = sorted(set(sp500 + ndx_syms + russell_syms) - EXCLUDED_SYMBOLS)
     logger.info(f"  Total universe: {len(all_syms)} unique symbols "
                 f"(excluded {len(EXCLUDED_SYMBOLS)} blacklisted)")
     report.set("universe_size", len(all_syms))
@@ -745,21 +780,208 @@ def compute_macro_features(macro_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# V6 FEATURES — extends v5 with drawdown, momentum, efficiency
+# ═══════════════════════════════════════════════════════════════════════════
+
+def compute_stock_features_v6(df: pd.DataFrame) -> pd.DataFrame:
+    """V6 features = v4 base features + new v6 signals."""
+    # Start with v4 features as base
+    feats_df = compute_stock_features(df)
+    c = df['close'].astype(float)
+    h = df['high'].astype(float)
+    lo = df['low'].astype(float)
+    v = df['volume'].astype(float)
+    ret = c.pct_change()
+
+    # Mean-reversion signals
+    for p in [20, 60]:
+        trend = c.rolling(p).mean().pct_change(5) * 100
+        actual = c.pct_change(5) * 100
+        feats_df[f'resid_mom_{p}'] = (actual - trend).astype(np.float32)
+
+    feats_df['reversal_20_5'] = ((c.pct_change(5) * 100) - (c.pct_change(20) * 100 * 0.25)).astype(np.float32)
+
+    for p in [20, 60, 120]:
+        ema = c.ewm(span=p, adjust=False).mean()
+        feats_df[f'trend_dev_{p}'] = ((c - ema) / (ema + 1e-8) * 100).astype(np.float32)
+
+    for p in [20, 60]:
+        rm = ret.rolling(p)
+        feats_df[f'ret_zscore_{p}'] = ((ret - rm.mean()) / (rm.std() + 1e-8)).astype(np.float32)
+
+    # SMA crossovers
+    sma_20 = c.rolling(20).mean()
+    sma_50 = c.rolling(50).mean()
+    sma_200 = c.rolling(200).mean()
+    feats_df['sma_20_50_cross'] = ((sma_20 - sma_50) / (sma_50 + 1e-8) * 100).astype(np.float32)
+    feats_df['sma_50_200_cross'] = ((sma_50 - sma_200) / (sma_200 + 1e-8) * 100).astype(np.float32)
+
+    # Volatility ratios
+    feats_df['vol_ratio_5_20'] = (ret.rolling(5).std() / (ret.rolling(20).std() + 1e-8)).astype(np.float32)
+    feats_df['vol_ratio_10_60'] = (ret.rolling(10).std() / (ret.rolling(60).std() + 1e-8)).astype(np.float32)
+
+    # Volume-price divergence
+    v_sma20 = v.rolling(20).mean()
+    feats_df['vp_divergence'] = (v / (v_sma20 + 1e-8) - (1 + ret.rolling(5).mean() * 10)).astype(np.float32)
+
+    # Accumulation/Distribution
+    clv = ((c - lo) - (h - c)) / (h - lo + 1e-8)
+    ad = (clv * v).cumsum()
+    ad_sma = ad.rolling(20).mean()
+    feats_df['ad_trend'] = ((ad - ad_sma) / (ad_sma.abs() + 1e-8)).astype(np.float32)
+
+    # Gap feature
+    if 'open' in df.columns:
+        feats_df['gap'] = ((df['open'].astype(float) / c.shift(1) - 1) * 100).astype(np.float32)
+
+    # Drawdown features
+    rolling_max_60 = c.rolling(60).max()
+    rolling_max_120 = c.rolling(120).max()
+    feats_df['drawdown_60'] = ((c - rolling_max_60) / (rolling_max_60 + 1e-8) * 100).astype(np.float32)
+    feats_df['drawdown_120'] = ((c - rolling_max_120) / (rolling_max_120 + 1e-8) * 100).astype(np.float32)
+
+    dd_60 = (c - rolling_max_60) / (rolling_max_60 + 1e-8)
+    feats_df['recovery_speed_60'] = (dd_60 - dd_60.shift(5)).astype(np.float32)
+
+    # Consecutive up/down days
+    feats_df['consec_up_5'] = (ret > 0).astype(float).rolling(5).sum().astype(np.float32)
+    feats_df['consec_down_5'] = (ret < 0).astype(float).rolling(5).sum().astype(np.float32)
+
+    # Move vs ATR
+    tr = pd.concat([h - lo, (h - c.shift(1)).abs(), (lo - c.shift(1)).abs()], axis=1).max(axis=1)
+    atr_14 = tr.rolling(14).mean()
+    feats_df['move_vs_atr'] = (c.diff(5).abs() / (atr_14 * np.sqrt(5) + 1e-8)).astype(np.float32)
+
+    # Volume acceleration
+    feats_df['vol_accel'] = ((v.rolling(5).mean() / (v.rolling(20).mean() + 1e-8)) -
+                             (v.rolling(20).mean() / (v.rolling(60).mean() + 1e-8))).astype(np.float32)
+
+    # Price efficiency
+    for p in [5, 20]:
+        directional = c.diff(p).abs()
+        total_path = ret.abs().rolling(p).sum() * c + 1e-8
+        feats_df[f'efficiency_{p}'] = (directional / total_path).astype(np.float32)
+
+    return feats_df
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# V6 REGIME DETECTION + CONVICTION SIZING (for live trading)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def compute_live_regime_score(macro_data: dict[str, pd.DataFrame]) -> float:
+    """Compute current market regime score for live portfolio construction.
+
+    Returns float in [-1, 1]: -1 = hostile, +1 = favorable.
+    """
+    signals = []
+
+    # VIX signal
+    if 'VIX' in macro_data:
+        vix = macro_data['VIX']['close']
+        if len(vix) >= 120:
+            vix_pct = vix.rank(pct=True).iloc[-1]
+            signals.append(('vix', 0.30, 1 - 2 * vix_pct))
+
+    # SPY trend signal
+    spy_data = macro_data.get('SPY')
+    if spy_data is not None:
+        spy_close = spy_data['close']
+        if len(spy_close) >= 200:
+            sma_200 = spy_close.rolling(200).mean().iloc[-1]
+            dist_pct = (spy_close.iloc[-1] - sma_200) / (sma_200 + 1e-8) * 100
+            signals.append(('trend', 0.30, max(-1, min(1, dist_pct / 5))))
+
+            # Momentum
+            if len(spy_close) >= 20:
+                ret_20 = (spy_close.iloc[-1] / spy_close.iloc[-20] - 1) * 100
+                signals.append(('momentum', 0.20, max(-1, min(1, ret_20 / 5))))
+
+    # Credit signal
+    if 'HYG' in macro_data:
+        hyg = macro_data['HYG']['close']
+        if len(hyg) >= 50:
+            hyg_sma50 = hyg.rolling(50).mean().iloc[-1]
+            hyg_dist = (hyg.iloc[-1] - hyg_sma50) / (hyg_sma50 + 1e-8) * 100
+            signals.append(('credit', 0.20, max(-1, min(1, hyg_dist / 2))))
+
+    if not signals:
+        return 0.0  # neutral if no data
+
+    total_weight = sum(w for _, w, _ in signals)
+    score = sum(w * s for _, w, s in signals) / total_weight
+    return max(-1.0, min(1.0, score))
+
+
+def regime_to_exposure(regime_score: float) -> float:
+    """Map regime score to portfolio exposure multiplier.
+
+    -1.0 -> 0.4 (40% exposure)
+     0.0 -> 0.85 (85% exposure)
+    +0.3 -> 1.0 (full exposure)
+    """
+    if regime_score >= 0.3:
+        return 1.0
+    elif regime_score >= 0.0:
+        return 0.85 + (regime_score / 0.3) * 0.15
+    elif regime_score >= -0.3:
+        return 0.7 + ((regime_score + 0.3) / 0.3) * 0.15
+    else:
+        return max(0.4, 0.7 + (regime_score + 0.3) / 0.7 * 0.3)
+
+
+def conviction_weights(
+    predictions: list[tuple[str, float]],
+    top_n: int = 20,
+    max_weight_multiple: float = 2.0,
+    regime_exposure: float = 1.0,
+) -> dict[str, float]:
+    """Convert ranked predictions into conviction-weighted allocations.
+
+    Returns {symbol: weight} where weights sum to regime_exposure.
+    """
+    top = predictions[:top_n]
+    if not top:
+        return {}
+
+    preds = np.array([p for _, p in top])
+    preds_shifted = preds - preds.min() + 0.01
+    raw_weights = preds_shifted / preds_shifted.sum()
+
+    equal_weight = 1.0 / top_n
+    max_weight = equal_weight * max_weight_multiple
+    capped = np.minimum(raw_weights, max_weight)
+    capped = capped / capped.sum() * regime_exposure
+
+    return {sym: round(float(w), 6) for (sym, _), w in zip(top, capped)}
+
+
+def _get_feature_func(feature_version: str):
+    """Return the appropriate feature computation function for a model version."""
+    if feature_version == "v6":
+        return compute_stock_features_v6
+    else:
+        return compute_stock_features
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # PREDICTION
 # ═══════════════════════════════════════════════════════════════════════════
 
 def predict_rankings(
     stock_data: dict, macro_features: pd.DataFrame,
     model, feature_cols: list, logger, report: RunReport,
+    feature_version: str = "v4",
 ) -> list[tuple[str, float]]:
     """Generate predictions for all stocks, return sorted rankings."""
     report.start_step("predict")
     predictions = {}
     failures = []
+    feat_func = _get_feature_func(feature_version)
 
     for sym, df in stock_data.items():
         try:
-            stock_feats = compute_stock_features(df)
+            stock_feats = feat_func(df)
 
             # Merge with macro
             if not macro_features.empty:
@@ -930,8 +1152,13 @@ def rebalance_portfolio(
     logger,
     report: RunReport,
     dry_run: bool = False,
+    target_weights: dict[str, float] = None,
 ):
-    """Rebalance to equal-weight long portfolio with full trade logging."""
+    """Rebalance portfolio with full trade logging.
+
+    If target_weights is provided (v6 conviction sizing), use those allocations.
+    Otherwise falls back to equal-weight across target_symbols.
+    """
     report.start_step("rebalance")
     rb_data = report.data.setdefault("rebalance", {})
     rb_data["dry_run"] = dry_run
@@ -957,8 +1184,20 @@ def rebalance_portfolio(
     to_buy = sorted(target_set - current_set)
     to_hold = sorted(current_set & target_set)
 
-    target_weight = portfolio_value / len(target_symbols)
-    rb_data["target_weight"] = target_weight
+    # Per-symbol target dollar allocations
+    if target_weights:
+        # Conviction-weighted (v6): each symbol has a custom weight
+        sym_allocations = {sym: portfolio_value * w for sym, w in target_weights.items()}
+        avg_weight = portfolio_value / len(target_symbols)
+        rb_data["target_weight"] = avg_weight
+        rb_data["sizing_mode"] = "conviction"
+        logger.info(f"  Sizing: CONVICTION-WEIGHTED (exposure={sum(target_weights.values()):.0%})")
+    else:
+        # Equal-weight (v4/v5): every stock gets the same allocation
+        avg_weight = portfolio_value / len(target_symbols)
+        sym_allocations = {sym: avg_weight for sym in target_symbols}
+        rb_data["target_weight"] = avg_weight
+        rb_data["sizing_mode"] = "equal"
 
     # Turnover calculation
     total_positions = max(len(target_set) + len(current_set), 1)
@@ -998,12 +1237,13 @@ def rebalance_portfolio(
     for sym in to_hold:
         pos = current_positions[sym]
         current_value = pos["market_value"]
-        diff = target_weight - current_value
-        drift_pct = abs(diff) / target_weight * 100
+        sym_target = sym_allocations.get(sym, avg_weight)
+        diff = sym_target - current_value
+        drift_pct = abs(diff) / (sym_target + 1e-8) * 100
         pred_ret, rank = pred_lookup.get(sym, (None, None))
         pred_str = f", pred={pred_ret:+.2f}% rank=#{rank}" if pred_ret is not None else ""
 
-        if abs(diff) > target_weight * 0.1:
+        if abs(diff) > sym_target * 0.1:
             if diff > 0:
                 direction = "BUY more"
                 trade_action = "rebalance_up"
@@ -1011,7 +1251,7 @@ def rebalance_portfolio(
                 direction = "TRIM"
                 trade_action = "rebalance_down"
 
-            logger.info(f"    REBAL {sym:6s}: ${current_value:,.0f} -> ${target_weight:,.0f} "
+            logger.info(f"    REBAL {sym:6s}: ${current_value:,.0f} -> ${sym_target:,.0f} "
                         f"(drift {drift_pct:.0f}%, {direction} ${abs(diff):,.0f}{pred_str})")
             n_rebalanced += 1
 
@@ -1034,14 +1274,15 @@ def rebalance_portfolio(
     # -- 3. Buy new positions --
     logger.info(f"\n  BUYS - {len(to_buy)} new positions:")
     for sym in to_buy:
+        sym_target = sym_allocations.get(sym, avg_weight)
         pred_ret, rank = pred_lookup.get(sym, (None, None))
         pred_str = f"pred={pred_ret:+.2f}%, rank=#{rank}" if pred_ret is not None else ""
-        logger.info(f"    NEW   {sym:6s}: ${target_weight:,.0f} ({pred_str})")
+        logger.info(f"    NEW   {sym:6s}: ${sym_target:,.0f} ({pred_str})")
 
         if not dry_run:
             orders.append({
                 "action": "buy_notional", "symbol": sym,
-                "notional": target_weight, "side": "buy",
+                "notional": sym_target, "side": "buy",
                 "trade_action": "new_position",
                 "predicted_return": pred_ret, "rank": rank,
             })
@@ -1205,6 +1446,7 @@ def run_single_model(
     mc: ModelConfig,
     stock_data: dict,
     macro_features: pd.DataFrame,
+    macro_data: dict = None,
     dry_run: bool = False,
     force: bool = False,
 ):
@@ -1268,8 +1510,10 @@ def run_single_model(
 
     # -- Step 4: Generate predictions --
     logger.info("\n[4/5] GENERATING PREDICTIONS")
+    logger.info(f"  Feature version: {mc.feature_version}")
     rankings = predict_rankings(
         stock_data, macro_features, model, feature_cols, logger, report,
+        feature_version=mc.feature_version,
     )
 
     if len(rankings) < TOP_N:
@@ -1285,24 +1529,78 @@ def run_single_model(
     for i, (sym, pred) in enumerate(rankings[:TOP_N]):
         logger.info(f"    {i+1:2d}. {sym:6s}  pred={pred:+6.2f}%")
 
+    # -- V6: Compute regime score & conviction weights --
+    tw = None  # target_weights: None = equal-weight (v4/v5 default)
+    regime_exposure = 1.0
+
+    if mc.feature_version == "v6" and macro_data is not None:
+        logger.info("\n  [V6] Computing market regime & conviction weights...")
+        try:
+            regime_score = compute_live_regime_score(macro_data)
+            regime_exposure = regime_to_exposure(regime_score)
+            regime_label = (
+                "FAVORABLE" if regime_score > 0.3
+                else "HOSTILE" if regime_score < -0.3
+                else "NEUTRAL"
+            )
+            logger.info(f"  [V6] Regime score: {regime_score:+.3f} ({regime_label})")
+            logger.info(f"  [V6] Exposure multiplier: {regime_exposure:.2f}")
+
+            tw = conviction_weights(
+                rankings, top_n=TOP_N,
+                max_weight_multiple=2.0,
+                regime_exposure=regime_exposure,
+            )
+            total_alloc = sum(tw.values())
+            max_w = max(tw.values()) if tw else 0
+            min_w = min(tw.values()) if tw else 0
+            logger.info(f"  [V6] Conviction weights: total_alloc={total_alloc:.4f}, "
+                        f"max={max_w:.4f}, min={min_w:.4f}")
+            for sym_w, w in sorted(tw.items(), key=lambda x: -x[1])[:5]:
+                logger.info(f"    {sym_w:6s}  weight={w:.4f}")
+            if len(tw) > 5:
+                logger.info(f"    ... and {len(tw) - 5} more")
+
+            # Use conviction-weighted target symbols
+            target_symbols = list(tw.keys())
+
+            report.set("v6_regime", {
+                "regime_score": round(regime_score, 4),
+                "regime_label": regime_label,
+                "exposure_multiplier": round(regime_exposure, 4),
+                "conviction_weights": {s: round(w, 6) for s, w in tw.items()},
+            })
+        except Exception as e:
+            logger.warning(f"  [V6] Regime/conviction failed, falling back to "
+                          f"equal-weight: {e}")
+            report.add_error(f"V6 regime computation failed: {e}")
+            tw = None
+    elif mc.feature_version == "v6":
+        logger.warning("  [V6] No macro_data available for regime - using equal-weight")
+
     # -- Step 5: Rebalance --
     logger.info("\n[5/5] REBALANCING PORTFOLIO")
     result = rebalance_portfolio(
-        target_symbols, rankings, mc, journal, logger, report, dry_run=dry_run
+        target_symbols, rankings, mc, journal, logger, report,
+        dry_run=dry_run, target_weights=tw,
     )
 
     # -- Save state --
     state["last_rebalance"] = datetime.now().isoformat()
     state["last_run"] = datetime.now().isoformat()
     state["run_count"] = state.get("run_count", 0) + 1
-    state["history"].append({
+    history_entry = {
         "date": datetime.now().isoformat(),
         "run_id": f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
         "target_symbols": target_symbols,
         "predictions": {s: round(p, 4) for s, p in rankings[:TOP_N]},
         "result": {k: v for k, v in result.items()
                    if k not in ("sells_detail", "buys_detail")},
-    })
+    }
+    if tw is not None:
+        history_entry["regime_exposure"] = round(regime_exposure, 4)
+        history_entry["conviction_weights"] = {s: round(w, 6) for s, w in tw.items()}
+    state["history"].append(history_entry)
     state["history"] = state["history"][-100:]
     save_state(state, mc)
 
@@ -1357,6 +1655,7 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
         logger.info(f"{'=' * 70}")
         try:
             run_single_model(mc, stock_data, macro_features,
+                             macro_data=macro_data,
                              dry_run=dry_run, force=force)
         except Exception as e:
             logger.error(f"Model {mc.name} FAILED: {e}\n{traceback.format_exc()}")
