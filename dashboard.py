@@ -356,9 +356,43 @@ def api_history_model(model_name):
 
 @app.route("/api/trades/<model_name>")
 def api_trades(model_name):
-    """Recent trades from the journal."""
+    """Recent trades from journal, falling back to Alpaca order history."""
     limit = int(flask_request.args.get("limit", 50))
     trades = _load_recent_trades(model_name, limit)
+
+    # If journal is empty, fetch from Alpaca order history
+    if not trades:
+        mc = _get_model_config(model_name)
+        if mc:
+            def fetch_orders():
+                logger = logging.getLogger("dashboard")
+                orders = pipeline.alpaca_request(
+                    "GET",
+                    "v2/orders?status=all&limit=100&direction=desc",
+                    mc, logger=logger
+                )
+                result = []
+                for o in orders:
+                    filled_qty = float(o.get("filled_qty", 0) or 0)
+                    filled_price = float(o.get("filled_avg_price", 0) or 0)
+                    notional = filled_qty * filled_price if filled_price else float(o.get("notional", 0) or 0)
+                    result.append({
+                        "timestamp": o.get("filled_at") or o.get("submitted_at") or o.get("created_at", ""),
+                        "symbol": o.get("symbol", ""),
+                        "trade_action": o.get("side", ""),
+                        "notional": round(notional, 2),
+                        "order_status": o.get("status", ""),
+                        "shares": filled_qty,
+                        "filled_price": filled_price,
+                        "order_type": o.get("type", ""),
+                        "error_message": "",
+                        "source": "alpaca",
+                    })
+                return result
+            alpaca_trades = _cached_api_call(f"orders_{model_name}", fetch_orders, ttl=60)
+            if alpaca_trades:
+                trades = alpaca_trades[:limit]
+
     return jsonify(trades)
 
 
@@ -950,24 +984,31 @@ def index():
     }}
 
     async function loadTrades(model) {{
-        const trades = await api(`/api/trades/${{model}}?limit=50`);
-        let html = '<div class="card"><h2>Recent Trades</h2>';
+        const trades = await api(`/api/trades/${{model}}?limit=100`);
+        let html = '<div class="card"><h2>Trade History</h2>';
 
         if (trades && trades.length > 0) {{
+            const isAlpaca = trades[0].source === 'alpaca';
+            if (isAlpaca) html += '<p style="font-size:11px;color:var(--text-dim);margin-bottom:8px">Source: Alpaca order history</p>';
+
             html += `<table>
-                <tr><th>Time</th><th>Symbol</th><th>Action</th><th class="text-right">Notional</th>
-                    <th>Status</th><th>Notes</th></tr>`;
+                <tr><th>Time</th><th>Symbol</th><th>Side</th><th class="text-right">Shares</th>
+                    <th class="text-right">Price</th><th class="text-right">Notional</th>
+                    <th>Status</th></tr>`;
             trades.forEach(t => {{
-                const action = t.trade_action || t.action || '-';
-                const actionCls = action.includes('buy') || action.includes('new') ? 'green' :
-                                  action.includes('sell') || action.includes('exit') ? 'red' : '';
+                const action = t.trade_action || t.side || t.action || '-';
+                const actionCls = action.includes('buy') ? 'green' :
+                                  action.includes('sell') ? 'red' : '';
+                const ts = t.timestamp || '';
+                const displayTs = ts.length > 16 ? ts.slice(0,10) + ' ' + ts.slice(11,16) : ts.slice(0,16);
                 html += `<tr>
-                    <td class="mono" style="font-size:11px">${{(t.timestamp || '').slice(5,16)}}</td>
+                    <td class="mono" style="font-size:11px">${{displayTs}}</td>
                     <td><strong>${{t.symbol || '-'}}</strong></td>
-                    <td class="${{actionCls}}">${{action}}</td>
+                    <td class="${{actionCls}}">${{action.toUpperCase()}}</td>
+                    <td class="text-right mono">${{t.shares ? fmtN(t.shares, t.shares % 1 === 0 ? 0 : 2) : '-'}}</td>
+                    <td class="text-right mono">${{t.filled_price ? fmt$(t.filled_price) : '-'}}</td>
                     <td class="text-right mono">${{t.notional ? fmt$(t.notional) : '-'}}</td>
                     <td>${{t.order_status || '-'}}</td>
-                    <td style="color:var(--text-dim);font-size:11px">${{t.error_message || ''}}</td>
                 </tr>`;
             }});
             html += '</table>';
