@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Daily ML trading pipeline for Railway deployment.
+"""Daily ML trading pipeline for Railway deployment — Multi-Model Edition.
 
 Runs once daily (triggered by cron):
 1. Download latest daily bars via yfinance (stocks + macro)
-2. Compute features (62 stock + 22 macro = 84 total, or v5 enhanced)
-3. Run LightGBM predictions → rank stocks
+2. Compute features (62 stock + 22 macro = 84 total for v4)
+3. Run model predictions → rank stocks
 4. Rebalance portfolio via Alpaca API (long top 20)
-5. Log full run report
+5. Log full run report + structured trade journal
 
-Supports multiple models (v4, v5) each with independent Alpaca accounts.
 Config: H5_LongOnly20 — 5-day horizon, long top 20, no shorts.
 Rebalances every 5 trading days.
 
+Multi-model: Reads MODEL_{name}_ALPACA_KEY / MODEL_{name}_ALPACA_SECRET
+env vars. Each model trades its own Alpaca account independently.
+
 Usage:
-    python pipeline.py                  # Run all active models
-    python pipeline.py --dry-run        # Predict only, no orders
-    python pipeline.py --force          # Force rebalance even if not due
-    python pipeline.py --model v4       # Run specific model only
+    python pipeline.py                          # Full run, all models
+    python pipeline.py --dry-run                # Predict only, no orders
+    python pipeline.py --force                  # Force rebalance
+    python pipeline.py --model v4               # Run single model only
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -27,13 +30,16 @@ import pickle
 import sys
 import time
 import traceback
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -44,68 +50,13 @@ HORIZON = 5             # Prediction horizon (trading days)
 MIN_HISTORY_DAYS = 250  # Minimum days of history needed for features
 LOOKBACK_DAYS = 300     # Days of history to download for feature computation
 
-# Alpaca base URL (same for all accounts)
-ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-if ALPACA_BASE_URL and not ALPACA_BASE_URL.startswith("http"):
-    ALPACA_BASE_URL = "https://" + ALPACA_BASE_URL.lstrip("htps:/")
+# Persistent data dir (Railway volume)
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 
 # Paths
 BASE_DIR = Path(__file__).parent
-DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data")))
 LOG_DIR = DATA_DIR / "logs"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MULTI-MODEL CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════
-
-class ModelConfig:
-    """Configuration for a single model instance."""
-    def __init__(self, name, model_path, feature_version, alpaca_key_env, alpaca_secret_env):
-        self.name = name
-        self.model_path = BASE_DIR / model_path
-        self.feature_version = feature_version  # "v4" or "v5"
-        self.alpaca_api_key = os.environ.get(alpaca_key_env, "")
-        self.alpaca_secret_key = os.environ.get(alpaca_secret_env, "")
-        self.state_path = DATA_DIR / "state" / f"pipeline_state_{name}.json"
-
-    @property
-    def has_credentials(self):
-        return bool(self.alpaca_api_key and self.alpaca_secret_key)
-
-    def get_headers(self):
-        return {
-            "APCA-API-KEY-ID": self.alpaca_api_key,
-            "APCA-API-SECRET-KEY": self.alpaca_secret_key,
-            "Content-Type": "application/json",
-        }
-
-
-def get_active_models():
-    """Return list of active model configs based on available env vars."""
-    models = []
-
-    # V4 model — original, uses ALPACA_API_KEY / ALPACA_SECRET_KEY (backward compat)
-    v4_key = os.environ.get("MODEL_V4_ALPACA_KEY", os.environ.get("ALPACA_API_KEY", ""))
-    v4_secret = os.environ.get("MODEL_V4_ALPACA_SECRET", os.environ.get("ALPACA_SECRET_KEY", ""))
-    if v4_key and v4_secret:
-        v4 = ModelConfig("v4", "model/v4/model.pkl", "v4", "MODEL_V4_ALPACA_KEY", "MODEL_V4_ALPACA_SECRET")
-        # Fallback to original env vars
-        if not v4.alpaca_api_key:
-            v4.alpaca_api_key = v4_key
-        if not v4.alpaca_secret_key:
-            v4.alpaca_secret_key = v4_secret
-        models.append(v4)
-
-    # V5 model — enhanced features + ensemble
-    v5_key = os.environ.get("MODEL_V5_ALPACA_KEY", "")
-    v5_secret = os.environ.get("MODEL_V5_ALPACA_SECRET", "")
-    if v5_key and v5_secret:
-        v5 = ModelConfig("v5", "model/v5/model.pkl", "v5", "MODEL_V5_ALPACA_KEY", "MODEL_V5_ALPACA_SECRET")
-        models.append(v5)
-
-    return models
-
+TRADE_DIR = DATA_DIR / "trades"
 
 # Macro tickers needed for features
 MACRO_TICKERS = [
@@ -122,116 +73,166 @@ EXCLUDED_SYMBOLS = {
     "DNA", "GRAB", "NU", "RKLB", "VFS", "SMCI",
 }
 
-# Hardcoded universe — S&P 500 + Nasdaq 100 stocks we trained on.
-# More reliable than scraping Wikipedia (which gets blocked by Railway).
-# Update this list every few months when index composition changes.
-STOCK_UNIVERSE = [
-    "A", "AA", "AAL", "AAOI", "AAON", "AAPL", "ABBV", "ABNB", "ABT", "ACAD",
-    "ACGL", "ACI", "ACM", "ACN", "ADBE", "ADC", "ADI", "ADM", "ADP", "ADSK",
-    "AEE", "AEIS", "AEM", "AEO", "AEP", "AES", "AFG", "AFL", "AFRM", "AG",
-    "AGCO", "AHR", "AIG", "AIT", "AIZ", "AJG", "AKAM", "ALB", "ALGM", "ALGN",
-    "ALK", "ALL", "ALLE", "ALLY", "ALNY", "ALV", "AM", "AMAT", "AMCR", "AMD",
-    "AME", "AMG", "AMGN", "AMH", "AMKR", "AMP", "AMPX", "AMT", "AMZN", "AN",
-    "ANET", "ANF", "AON", "AOS", "APA", "APD", "APG", "APH", "APLS", "APO",
-    "APP", "APPF", "APTV", "AR", "ARCT", "ARE", "ARES", "ARM", "ARMK", "ARW",
-    "ARWR", "ASB", "ASH", "ASML", "ATI", "ATO", "ATR", "AVAV", "AVB", "AVGO",
-    "AVNT", "AVT", "AVTR", "AVY", "AWK", "AXON", "AXP", "AXTA", "AYI", "AZO",
-    "BA", "BAC", "BAH", "BALL", "BAX", "BBWI", "BBY", "BC", "BCO", "BCS",
-    "BDC", "BDX", "BEAM", "BEN", "BF-B", "BG", "BHF", "BIIB", "BILL", "BIO",
-    "BITF", "BJ", "BK", "BKH", "BKNG", "BKR", "BLD", "BLDR", "BLK", "BLKB",
-    "BMNR", "BMRN", "BMY", "BN", "BP", "BR", "BRBR", "BRK-B", "BRKR", "BRO",
-    "BROS", "BRX", "BSX", "BSY", "BTG", "BURL", "BVN", "BWA", "BWXT", "BX",
-    "BXP", "BYD", "C", "CACI", "CAG", "CAH", "CAR", "CARR", "CART", "CASY",
-    "CAT", "CAVA", "CB", "CBOE", "CBRE", "CBSH", "CBT", "CCEP", "CCI", "CCK",
-    "CCL", "CDE", "CDNS", "CDP", "CDW", "CEG", "CELH", "CENX", "CF", "CFG",
-    "CFR", "CG", "CGNX", "CHD", "CHDN", "CHE", "CHH", "CHRD", "CHRW", "CHTR",
-    "CHWY", "CI", "CIEN", "CIFR", "CINF", "CL", "CLF", "CLH", "CLSK", "CLX",
-    "CMC", "CMCSA", "CME", "CMG", "CMI", "CMS", "CNC", "CNH", "CNM", "CNO",
-    "CNP", "CNQ", "CNX", "CNXC", "COF", "COHR", "COIN", "COKE", "COLB", "COLM",
-    "COO", "COP", "COR", "COST", "COTY", "CPAY", "CPB", "CPRI", "CPRT", "CPT",
-    "CR", "CRBG", "CRCL", "CRGY", "CRH", "CRL", "CRM", "CROX", "CRS", "CRSP",
-    "CRUS", "CRWD", "CSCO", "CSGP", "CSL", "CSX", "CTAS", "CTRA", "CTRE", "CTSH",
-    "CTVA", "CUBE", "CUZ", "CVLT", "CVNA", "CVS", "CVX", "CW", "CXT", "CYTK",
-    "CZR", "D", "DAC", "DAL", "DAR", "DASH", "DAWN", "DBX", "DCI", "DD",
-    "DDOG", "DE", "DECK", "DELL", "DG", "DGX", "DHI", "DHR", "DHT", "DINO",
-    "DIS", "DKNG", "DKS", "DLB", "DLR", "DLTR", "DOC", "DOCS", "DOCU", "DOV",
-    "DOW", "DPZ", "DRI", "DT", "DTE", "DTM", "DUK", "DUOL", "DVA", "DVN",
-    "DXCM", "DY", "EA", "EBAY", "ECL", "ED", "EDIT", "EEFT", "EFX", "EG",
-    "EGP", "EHC", "EIX", "EL", "ELAN", "ELF", "ELS", "ELV", "EME", "EMR",
-    "ENS", "ENSG", "ENTG", "EOG", "EPAM", "EPR", "EQH", "EQIX", "EQNR", "EQR",
-    "EQT", "EQX", "ERIE", "ES", "ESAB", "ESNT", "ESS", "ET", "ETN", "ETR",
-    "EVR", "EVRG", "EW", "EWBC", "EXAS", "EXC", "EXE", "EXEL", "EXLS", "EXP",
-    "EXPD", "EXPE", "EXPO", "EXR", "F", "FAF", "FANG", "FAST", "FATE", "FBIN",
-    "FCFS", "FCN", "FCX", "FDS", "FDX", "FE", "FER", "FFIN", "FFIV", "FHI",
-    "FHN", "FICO", "FIGR", "FIS", "FISV", "FITB", "FIVE", "FIX", "FLEX", "FLG",
-    "FLO", "FLR", "FLS", "FN", "FNB", "FND", "FNF", "FOUR", "FOX", "FOXA",
-    "FR", "FRO", "FRT", "FSLR", "FTI", "FTNT", "FTV", "G", "GAP", "GATX",
-    "GBCI", "GD", "GDDY", "GE", "GEF", "GEHC", "GEN", "GEV", "GGG", "GHC",
-    "GILD", "GIS", "GL", "GLPI", "GLW", "GM", "GME", "GMED", "GNRC", "GNTX",
-    "GOLD", "GOOG", "GOOGL", "GPC", "GPK", "GPN", "GRMN", "GS", "GT", "GTLS",
-    "GWRE", "GWW", "GXO", "H", "HAE", "HAL", "HALO", "HAS", "HBAN", "HCA",
-    "HD", "HDB", "HGV", "HIG", "HII", "HIMS", "HL", "HLI", "HLNE", "HLT",
-    "HOG", "HOLX", "HOMB", "HON", "HOOD", "HP", "HPE", "HPQ", "HQY", "HR",
-    "HRB", "HRL", "HSIC", "HST", "HSY", "HUBB", "HUM", "HUT", "HWC", "HWM",
-    "HXL", "IBKR", "IBM", "IBOC", "ICE", "IDA", "IDCC", "IDXX", "IEX", "IFF",
-    "ILMN", "INCY", "INGR", "INSM", "INSW", "INTC", "INTU", "INVH", "IONQ", "IOT",
-    "IP", "IPGP", "IQV", "IR", "IRM", "IRT", "ISRG", "IT", "ITT", "ITW",
-    "IVZ", "J", "JAZZ", "JBHT", "JBL", "JCI", "JEF", "JHG", "JKHY", "JLL",
-    "JNJ", "JPM", "KBH", "KBR", "KD", "KDP", "KEX", "KEY", "KEYS", "KGC",
-    "KHC", "KIM", "KKR", "KLAC", "KMB", "KMI", "KNF", "KNSL", "KNX", "KO",
-    "KR", "KRC", "KRG", "KTOS", "KVUE", "L", "LAD", "LAMR", "LDOS", "LEA",
-    "LECO", "LEN", "LFUS", "LH", "LHX", "LII", "LIN", "LITE", "LIVN", "LLY",
-    "LMT", "LNT", "LNTH", "LOPE", "LOW", "LPX", "LRCX", "LSCC", "LSTR", "LULU",
-    "LUV", "LVS", "LYB", "LYFT", "LYV", "M", "MA", "MAA", "MANH", "MAR",
-    "MARA", "MAS", "MASI", "MAT", "MCD", "MCHP", "MCK", "MCO", "MDLZ", "MDT",
-    "MEDP", "MELI", "MET", "META", "MGM", "MIDD", "MKC", "MKSI", "MLI", "MLM",
-    "MMM", "MMS", "MNST", "MO", "MOG-A", "MORN", "MOS", "MP", "MPC", "MPWR",
-    "MRK", "MRNA", "MRSH", "MRVL", "MS", "MSA", "MSCI", "MSFT", "MSI", "MSM",
-    "MSTR", "MTB", "MTD", "MTDR", "MTG", "MTN", "MTSI", "MTZ", "MU", "MUD",
-    "MUR", "MUSA", "NBIX", "NCLH", "NDAQ", "NDSN", "NEE", "NEM", "NET",
-    "NEU", "NFG", "NFLX", "NGD", "NI", "NIO", "NJR", "NKE", "NLY", "NNN",
-    "NOC", "NOV", "NOVT", "NOW", "NRG", "NSA", "NSC", "NTAP", "NTLA", "NTNX",
-    "NTRS", "NUE", "NVDA", "NVR", "NVST", "NVT", "NVTS", "NWE", "NWS", "NWSA",
-    "NXPI", "NXST", "NXT", "NYT", "O", "OC", "ODFL", "OGE", "OGS", "OHI",
-    "OKE", "OKTA", "OLED", "OLLI", "OLN", "OMC", "ON", "ONB", "ONON", "ONTO",
-    "OPCH", "ORA", "ORCL", "ORI", "ORLY", "OSK", "OTIS", "OVV", "OWL", "OXY",
-    "OZK", "PAAS", "PAG", "PANW", "PATH", "PAYX", "PB", "PBF", "PBR", "PCAR",
-    "PCG", "PCTY", "PDD", "PEG", "PEGA", "PEN", "PENN", "PEP", "PFE", "PFG",
-    "PFGC", "PG", "PGR", "PH", "PHM", "PII", "PINS", "PK", "PKG", "PLD",
-    "PLNT", "PLTD", "PLTR", "PM", "PNC", "PNFP", "PNR", "PNW", "PODD", "POOL",
-    "POR", "POST", "PPC", "PPG", "PPL", "PR", "PRI", "PRU", "PSA", "PSKY",
-    "PSN", "PSTG", "PSX", "PTC", "PTEN", "PVH", "PWR", "PYPL", "QCOM", "QLYS",
-    "QUBT", "R", "RARE", "RBA", "RBC", "RBLX", "RCAT", "RCL", "REG", "REGN",
-    "REXR", "RF", "RGA", "RGEN", "RGLD", "RGTI", "RH", "RIOT", "RJF", "RKT",
-    "RL", "RLI", "RMBS", "RMD", "RNR", "ROIV", "ROK", "ROKU", "ROL", "ROP",
-    "ROST", "RPM", "RRC", "RRX", "RS", "RSG", "RTX", "RUN", "RVTY", "RYAN",
-    "RYN", "SAIA", "SAIC", "SAM", "SARO", "SATS", "SAVA", "SBAC", "SBLK", "SBRA",
-    "SBUX", "SCHW", "SCI", "SE", "SEIC", "SF", "SFM", "SGI", "SHC", "SHOP",
-    "SHW", "SIGI", "SITM", "SJM", "SLAB", "SLB", "SLGN", "SLM", "SM", "SMCI",
-    "SMG", "SNA", "SNAP", "SNOW", "SNPS", "SNX", "SO", "SOC", "SOFI", "SOLV",
-    "SON", "SPG", "SPGI", "SPOT", "SPXC", "SR", "SRE", "SRPT", "SSB", "SSD",
-    "SSRM", "ST", "STAG", "STE", "STLD", "STNG", "STRL", "STT", "STWD", "STX",
-    "STZ", "SW", "SWK", "SWKS", "SWX", "SYF", "SYK", "SYNA", "SYY", "T",
-    "TAP", "TCBI", "TDG", "TDY", "TEAM", "TECH", "TECK", "TEL", "TER", "TEVA",
-    "TEX", "TFC", "TGT", "THC", "THG", "THO", "TJX", "TKO", "TKR", "TLN",
-    "TMHC", "TMO", "TMUS", "TNK", "TNL", "TOL", "TPL", "TPR", "TREX", "TRGP",
-    "TRI", "TRMB", "TROW", "TRU", "TRV", "TSCO", "TSLA", "TSLG", "TSM", "TSN",
-    "TT", "TTC", "TTD", "TTEK", "TTMI", "TTWO", "TWLO", "TXN", "TXNM", "TXRH",
-    "TXT", "TYL", "UAL", "UBER", "UBSI", "UDR", "UEC", "UFPI", "UGI", "UHS",
-    "ULTA", "UMBF", "UNH", "UNM", "UNP", "UPS", "UPST", "URI", "USB", "USFD",
-    "UTHR", "UUUU", "V", "VAL", "VALE", "VC", "VFC", "VG", "VICI", "VICR",
-    "VLO", "VLTO", "VLY", "VMC", "VMI", "VNO", "VNOM", "VNT", "VOYA", "VRSK",
-    "VRSN", "VRT", "VRTX", "VST", "VTR", "VTRS", "VVV", "VZ", "WAB", "WAL",
-    "WAT", "WBD", "WBS", "WCC", "WDAY", "WDC", "WEC", "WELL", "WEX", "WFC",
-    "WFRD", "WH", "WHR", "WING", "WLK", "WM", "WMB", "WMG", "WMS", "WMT",
-    "WPC", "WPM", "WRB", "WSM", "WSO", "WST", "WTFC", "WTRG", "WTS", "WTW",
-    "WWD", "WY", "WYNN", "XEL", "XOM", "XP", "XPEV", "XPO", "XRAY", "XYL",
-    "XYZ", "YETI", "YUM", "ZBH", "ZBRA", "ZIM", "ZION", "ZM", "ZS", "ZTS",
-]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MULTI-MODEL CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ModelConfig:
+    """Configuration for a single model instance."""
+    name: str                   # e.g. "v4", "v5"
+    model_path: Path            # path to model.pkl
+    feature_version: str        # "v4" or "v5"
+    alpaca_key: str             # per-model Alpaca API key
+    alpaca_secret: str          # per-model Alpaca API secret
+    alpaca_base_url: str = "https://paper-api.alpaca.markets"
+    state_path: Path = None     # auto-set if None
+
+    def __post_init__(self):
+        if self.state_path is None:
+            self.state_path = DATA_DIR / "state" / f"pipeline_state_{self.name}.json"
+
+
+def get_active_models() -> list[ModelConfig]:
+    """Discover active models from environment variables.
+
+    Looks for MODEL_{NAME}_ALPACA_KEY / MODEL_{NAME}_ALPACA_SECRET pairs.
+    Falls back to legacy ALPACA_API_KEY / ALPACA_SECRET_KEY for v4.
+    """
+    models = []
+
+    # v4 model
+    v4_key = os.environ.get("MODEL_V4_ALPACA_KEY",
+                            os.environ.get("ALPACA_API_KEY", ""))
+    v4_secret = os.environ.get("MODEL_V4_ALPACA_SECRET",
+                               os.environ.get("ALPACA_SECRET_KEY", ""))
+    v4_model_path = BASE_DIR / "model" / "v4" / "model.pkl"
+    if not v4_model_path.exists():
+        v4_model_path = BASE_DIR / "model" / "ml_v4_model.pkl"
+
+    if v4_key and v4_secret and v4_model_path.exists():
+        models.append(ModelConfig(
+            name="v4",
+            model_path=v4_model_path,
+            feature_version="v4",
+            alpaca_key=v4_key,
+            alpaca_secret=v4_secret,
+        ))
+
+    # v5 model
+    v5_key = os.environ.get("MODEL_V5_ALPACA_KEY", "")
+    v5_secret = os.environ.get("MODEL_V5_ALPACA_SECRET", "")
+    v5_model_path = BASE_DIR / "model" / "v5" / "model.pkl"
+
+    if v5_key and v5_secret and v5_model_path.exists():
+        models.append(ModelConfig(
+            name="v5",
+            model_path=v5_model_path,
+            feature_version="v5",
+            alpaca_key=v5_key,
+            alpaca_secret=v5_secret,
+        ))
+
+    return models
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# LOGGING
+# TRADE JOURNAL — structured, queryable trade logging
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TradeRecord:
+    """A single trade event — one per order submitted."""
+    # Identity
+    trade_id: str                   # unique: {model}_{timestamp}_{symbol}_{side}
+    run_id: str                     # links all trades from the same rebalance
+    model: str                      # "v4", "v5"
+    timestamp: str                  # ISO-8601 UTC when order was submitted
+
+    # Order details
+    symbol: str
+    side: str                       # "buy" | "sell"
+    action: str                     # "new_position" | "exit_position" | "rebalance_up" | "rebalance_down"
+    order_type: str                 # "market"
+    time_in_force: str              # "day"
+
+    # Amounts
+    notional_usd: float             # dollar amount of the order
+    shares: Optional[float] = None  # filled qty (updated post-fill)
+    fill_price: Optional[float] = None  # avg fill price (updated post-fill)
+
+    # Model context — why this trade was made
+    predicted_return_pct: Optional[float] = None  # model's predicted 5d return %
+    rank: Optional[int] = None                    # rank in prediction list (1 = best)
+    target_weight_usd: Optional[float] = None     # target dollar allocation
+
+    # Position context (for exits / rebalances)
+    entry_price: Optional[float] = None           # avg entry price before this trade
+    current_price: Optional[float] = None         # price at time of trade decision
+    unrealized_pnl_usd: Optional[float] = None    # P&L at time of exit
+    unrealized_pnl_pct: Optional[float] = None    # P&L % at time of exit
+    holding_period_days: Optional[int] = None      # approx days held (for exits)
+    position_value_before: Optional[float] = None  # position $ value before trade
+
+    # Alpaca response
+    order_id: Optional[str] = None          # Alpaca order ID
+    order_status: str = "pending"           # "submitted" | "filled" | "failed"
+    error_message: Optional[str] = None     # if order failed
+
+    # Portfolio context
+    portfolio_value: Optional[float] = None     # total portfolio $ at rebalance
+    cash_before: Optional[float] = None         # cash $ before this order
+    total_positions: Optional[int] = None       # # positions after rebalance target
+    rebalance_turnover_pct: Optional[float] = None  # overall turnover this cycle
+
+
+class TradeJournal:
+    """Persistent trade log — appends to JSON Lines + CSV files per model."""
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        TRADE_DIR.mkdir(parents=True, exist_ok=True)
+        self.jsonl_path = TRADE_DIR / f"trades_{model_name}.jsonl"
+        self.csv_path = TRADE_DIR / f"trades_{model_name}.csv"
+
+    def log_trade(self, record: TradeRecord):
+        """Append a trade record to both JSONL and CSV."""
+        data = asdict(record)
+
+        # Append to JSONL (one JSON object per line — easy to parse)
+        with open(self.jsonl_path, "a") as f:
+            f.write(json.dumps(data, default=str) + "\n")
+
+        # Append to CSV (for spreadsheet analysis)
+        write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=data.keys())
+            if write_header:
+                writer.writeheader()
+            writer.writerow(data)
+
+    def get_trades(self, symbol: str = None, since: str = None) -> list[dict]:
+        """Read trades back from the journal (for analysis endpoints)."""
+        trades = []
+        if not self.jsonl_path.exists():
+            return trades
+        with open(self.jsonl_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if symbol and rec.get("symbol") != symbol:
+                    continue
+                if since and rec.get("timestamp", "") < since:
+                    continue
+                trades.append(rec)
+        return trades
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RUN REPORT (enhanced with trade journal integration)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RunReport:
@@ -305,16 +306,17 @@ class RunReport:
             lines.append(f"    Stocks predicted:     {self.data.get('n_predictions', '?')}")
             lines.append(f"    Prediction failures:  {self.data.get('prediction_failures', '?')}")
             pred_range = self.data.get("prediction_range", {})
-            lines.append(f"    Pred range:           {pred_range.get('min', '?'):.2f}% to {pred_range.get('max', '?'):.2f}%")
-            lines.append(f"    Pred mean:            {pred_range.get('mean', '?'):.2f}%")
-            lines.append(f"    Pred std:             {pred_range.get('std', '?'):.2f}%")
+            if pred_range:
+                lines.append(f"    Pred range:           {pred_range.get('min', 0):.2f}% to {pred_range.get('max', 0):.2f}%")
+                lines.append(f"    Pred mean:            {pred_range.get('mean', 0):.2f}%")
+                lines.append(f"    Pred std:             {pred_range.get('std', 0):.2f}%")
             lines.append("")
 
         # Portfolio
         if "target_portfolio" in self.data:
             lines.append("  TARGET PORTFOLIO (top 20):")
             for i, (sym, pred) in enumerate(self.data["target_portfolio"]):
-                lines.append(f"    {i+1:2d}. {sym:6s}  {pred:+6.2f}%")
+                lines.append(f"    {i+1:2d}. {sym:6s}  pred={pred:+6.2f}%")
             lines.append("")
 
         # Rebalance
@@ -332,14 +334,24 @@ class RunReport:
             lines.append(f"    Held (no change):      {rb.get('n_held', 0)}")
             lines.append(f"    Turnover:              {rb.get('turnover', 0):.0%}")
             if not rb.get("dry_run"):
-                lines.append(f"    Orders executed:       {rb.get('executed', 0)}")
+                lines.append(f"    Orders submitted:      {rb.get('executed', 0)}")
                 lines.append(f"    Orders failed:         {rb.get('failed', 0)}")
 
-            # Detail sold/bought
             if rb.get("sells_detail"):
                 lines.append(f"    Sold:   {', '.join(rb['sells_detail'])}")
             if rb.get("buys_detail"):
                 lines.append(f"    Bought: {', '.join(rb['buys_detail'])}")
+            lines.append("")
+
+        # Trade journal summary
+        if "trade_log_summary" in self.data:
+            tls = self.data["trade_log_summary"]
+            lines.append("  TRADE JOURNAL:")
+            lines.append(f"    Trades logged:         {tls.get('count', 0)}")
+            lines.append(f"    Total notional:        ${tls.get('total_notional', 0):,.2f}")
+            lines.append(f"    Buy notional:          ${tls.get('buy_notional', 0):,.2f}")
+            lines.append(f"    Sell notional:         ${tls.get('sell_notional', 0):,.2f}")
+            lines.append(f"    Journal file:          {tls.get('file', '?')}")
             lines.append("")
 
         # Warnings / Errors
@@ -357,16 +369,19 @@ class RunReport:
                 lines.append(f"    - {e}")
             lines.append("")
 
-        # Final status
         status = "SUCCESS" if not self.errors else "COMPLETED WITH ERRORS"
         lines.append(f"  STATUS: {status}")
         lines.append("=" * 70)
         return "\n".join(lines)
 
 
-def setup_logging():
+# ═══════════════════════════════════════════════════════════════════════════
+# LOGGING SETUP
+# ═══════════════════════════════════════════════════════════════════════════
+
+def setup_logging(model_name: str = "main"):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOG_DIR / f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = LOG_DIR / f"pipeline_{model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
@@ -376,12 +391,14 @@ def setup_logging():
     for h in handlers:
         h.setFormatter(fmt)
 
-    logger = logging.getLogger()
+    logger = logging.getLogger(f"pipeline.{model_name}")
     logger.setLevel(logging.INFO)
+    # Clear existing handlers to avoid duplication on re-run
+    logger.handlers.clear()
     for h in handlers:
         logger.addHandler(h)
 
-    return logging.getLogger("pipeline"), log_file
+    return logger, log_file
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -389,105 +406,173 @@ def setup_logging():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
-    """Return hardcoded stock universe (307 stocks from S&P 500 + Nasdaq 100)."""
+    """Get S&P 500 + Nasdaq 100 symbols from Wikipedia."""
     report.start_step("get_universe")
-    symbols = [s for s in STOCK_UNIVERSE if s not in EXCLUDED_SYMBOLS]
-    logger.info(f"  Universe: {len(symbols)} stocks (hardcoded, excludes {len(EXCLUDED_SYMBOLS)} blacklisted)")
-    report.set("universe_size", len(symbols))
+    sp500, ndx_syms = [], []
+
+    try:
+        sp500 = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        )[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        logger.info(f"  S&P 500: {len(sp500)} symbols from Wikipedia")
+    except Exception as e:
+        logger.warning(f"  S&P 500 scrape failed: {e}")
+        report.add_warning(f"S&P 500 scrape failed: {e}")
+
+    try:
+        ndx = pd.read_html(
+            "https://en.wikipedia.org/wiki/Nasdaq-100#Components"
+        )
+        for table in ndx:
+            if "Ticker" in table.columns:
+                ndx_syms = table["Ticker"].str.replace(".", "-", regex=False).tolist()
+                break
+            elif "Symbol" in table.columns:
+                ndx_syms = table["Symbol"].str.replace(".", "-", regex=False).tolist()
+                break
+        logger.info(f"  Nasdaq 100: {len(ndx_syms)} symbols from Wikipedia")
+    except Exception as e:
+        logger.warning(f"  Nasdaq 100 scrape failed: {e}")
+        report.add_warning(f"Nasdaq 100 scrape failed: {e}")
+
+    all_syms = sorted(set(sp500 + ndx_syms) - EXCLUDED_SYMBOLS)
+    logger.info(f"  Total universe: {len(all_syms)} unique symbols "
+                f"(excluded {len(EXCLUDED_SYMBOLS)} blacklisted)")
+    report.set("universe_size", len(all_syms))
     report.end_step("get_universe")
-    return symbols
+    return all_syms
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize yfinance column names to lowercase."""
-    df.columns = df.columns.str.lower()
+    """Normalize yfinance column names (handles MultiIndex from newer versions)."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    df.columns = [str(c).lower().strip() for c in df.columns]
     return df
 
 
-def download_bars(symbols: list[str], days: int, logger, report: RunReport) -> dict[str, pd.DataFrame]:
-    """Download OHLCV data for multiple symbols using yfinance."""
-    report.start_step("download_bars")
-    logger.info(f"  Downloading {len(symbols)} symbols, {days} days...")
+def download_bars(symbols: list[str], days: int, logger,
+                  report: RunReport) -> dict[str, pd.DataFrame]:
+    """Download recent daily bars from Yahoo Finance."""
+    report.start_step("download_stocks")
+    end = datetime.now()
+    start = end - timedelta(days=int(days * 1.5))
 
-    stock_data = {}
-    failures = []
+    logger.info(f"  Date range: {start.date()} -> {end.date()}")
+    logger.info(f"  Symbols to download: {len(symbols)}")
 
-    for i, sym in enumerate(symbols):
-        if (i + 1) % 50 == 0:
-            logger.info(f"    Progress: {i + 1}/{len(symbols)}...")
+    data = {}
+    failed_syms = []
+    batch_size = 50
+    n_batches = (len(symbols) + batch_size - 1) // batch_size
+
+    for batch_idx in range(0, len(symbols), batch_size):
+        batch_num = batch_idx // batch_size + 1
+        batch = symbols[batch_idx:batch_idx + batch_size]
+        tickers_str = " ".join(batch)
+        batch_start = time.time()
 
         try:
-            df = yf.download(sym, period=f"{days}d", progress=False)
-            df = _normalize_columns(df)
+            df = yf.download(
+                tickers_str, start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                group_by="ticker", auto_adjust=True, progress=False,
+                threads=True,
+            )
+            batch_ok = 0
+            for sym in batch:
+                try:
+                    if len(batch) == 1:
+                        sym_df = df.copy()
+                    else:
+                        sym_df = df[sym].copy()
+                    sym_df = _normalize_columns(sym_df)
+                    sym_df = sym_df.dropna(subset=["close"])
+                    if len(sym_df) >= MIN_HISTORY_DAYS:
+                        data[sym] = sym_df
+                        batch_ok += 1
+                    else:
+                        failed_syms.append(sym)
+                except Exception:
+                    failed_syms.append(sym)
 
-            # Ensure minimal data requirement
-            if len(df) < MIN_HISTORY_DAYS:
-                failures.append((sym, f"only {len(df)} days < {MIN_HISTORY_DAYS}"))
-                continue
+            batch_time = time.time() - batch_start
+            logger.info(f"  Batch {batch_num}/{n_batches}: "
+                        f"{batch_ok}/{len(batch)} ok ({batch_time:.1f}s)")
 
-            stock_data[sym] = df
         except Exception as e:
-            failures.append((sym, str(e)))
+            logger.warning(f"  Batch {batch_num}/{n_batches} FAILED: {e}")
+            report.add_warning(f"Stock batch {batch_num} failed: {e}")
+            failed_syms.extend(batch)
 
-    logger.info(f"  Downloaded: {len(stock_data)} ok, {len(failures)} failed")
-    if failures and len(failures) <= 20:
-        for sym, reason in failures:
-            logger.info(f"    SKIP {sym}: {reason}")
+        time.sleep(0.3)
 
-    report.set("stocks_downloaded", len(stock_data))
-    report.set("stocks_failed", len(failures))
-    report.end_step("download_bars")
-    return stock_data
+    logger.info(f"  Downloaded: {len(data)} symbols, "
+                f"failed: {len(failed_syms)} symbols")
+
+    if data:
+        sample_sym = next(iter(data))
+        sample_df = data[sample_sym]
+        logger.info(f"  Sample ({sample_sym}): {len(sample_df)} days, "
+                    f"{sample_df.index[0].date()} -> {sample_df.index[-1].date()}")
+        report.set("latest_data_date", str(sample_df.index[-1].date()))
+
+    report.set("stocks_downloaded", len(data))
+    report.set("stocks_failed", len(failed_syms))
+    if failed_syms and len(failed_syms) <= 20:
+        report.add_warning(f"Failed stocks: {', '.join(failed_syms)}")
+    report.end_step("download_stocks")
+    return data
 
 
 def download_macro(days: int, logger, report: RunReport) -> dict[str, pd.DataFrame]:
-    """Download macro/index data needed for features."""
+    """Download macro tickers."""
     report.start_step("download_macro")
+    end = datetime.now()
+    start = end - timedelta(days=int(days * 1.5))
 
-    # Map tickers with special handling
-    tickers_to_get = list(MACRO_TICKERS)
-    rename_map = dict(MACRO_RENAME)
-
-    # Add "SP500" if not already present and we have SPY
-    if "SPY" in tickers_to_get and "SP500" not in tickers_to_get:
-        tickers_to_get.append("^GSPC")  # S&P 500 index
-        rename_map["^GSPC"] = "SP500"
-
-    macro_data = {}
+    macro = {}
     missing = []
 
-    for ticker in tickers_to_get:
+    for ticker in MACRO_TICKERS:
         try:
-            df = yf.download(ticker, period=f"{days}d", progress=False)
+            df = yf.download(
+                ticker, start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                auto_adjust=True, progress=False,
+            )
             df = _normalize_columns(df)
-
-            if df.empty or len(df) < MIN_HISTORY_DAYS:
+            name = MACRO_RENAME.get(ticker, ticker)
+            df_clean = df.dropna(subset=["close"])
+            if len(df_clean) > 0:
+                macro[name] = df_clean
+                logger.info(f"  {name:6s}: {len(df_clean)} days, "
+                            f"latest close: {df_clean['close'].iloc[-1]:.2f}")
+            else:
                 missing.append(ticker)
-                continue
-
-            # Apply rename if needed
-            final_name = rename_map.get(ticker, ticker)
-            macro_data[final_name] = df
+                logger.warning(f"  {ticker}: no data returned")
         except Exception as e:
-            logger.debug(f"  Macro download failed for {ticker}: {e}")
             missing.append(ticker)
+            logger.warning(f"  {ticker}: FAILED - {e}")
+            report.add_warning(f"Macro {ticker} failed: {e}")
+        time.sleep(0.1)
 
-    logger.info(f"  Macro tickers: {len(macro_data)}/{len(tickers_to_get)}")
+    logger.info(f"  Macro: {len(macro)}/{len(MACRO_TICKERS)} downloaded")
     if missing:
-        logger.info(f"    Missing: {', '.join(missing)}")
+        logger.warning(f"  Missing: {', '.join(missing)}")
 
-    report.set("macro_downloaded", len(macro_data))
+    report.set("macro_downloaded", len(macro))
     report.set("macro_missing", missing)
     report.end_step("download_macro")
-    return macro_data
+    return macro
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FEATURE COMPUTATION
+# FEATURE ENGINEERING (same as train_ml_v4.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def compute_stock_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-stock daily features — v4 version (identical to training pipeline)."""
+    """Compute per-stock daily features — identical to training pipeline."""
     c = df["close"].astype(float)
     h = df["high"].astype(float)
     l = df["low"].astype(float)
@@ -600,171 +685,6 @@ def compute_stock_features(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def compute_stock_features_v5(df: pd.DataFrame) -> pd.DataFrame:
-    """Enhanced per-stock features with mean-reversion and cleaner set — v5 version."""
-    c = df['close'].astype(float)
-    h = df['high'].astype(float)
-    lo = df['low'].astype(float)
-    v = df['volume'].astype(float)
-    ret = c.pct_change()
-
-    feats = {}
-
-    # ── Returns (deduplicated — removed roc_* which duplicated ret_*) ──
-    for d in [1, 2, 3, 5, 10, 20, 60, 120]:
-        feats[f'ret_{d}d'] = c.pct_change(d) * 100
-
-    # ── NEW: Mean-reversion signals ──
-    # Residual momentum: return minus trend component
-    for p in [20, 60]:
-        trend = c.rolling(p).mean().pct_change(5) * 100
-        actual = c.pct_change(5) * 100
-        feats[f'resid_mom_{p}'] = actual - trend
-
-    # Short-term reversal (1-week return after 4-week run-up)
-    feats['reversal_20_5'] = feats['ret_5d'] - c.pct_change(20) * 100 * 0.25
-
-    # Deviation from trend — how far price is from its exponential trend
-    for p in [20, 60, 120]:
-        ema = c.ewm(span=p, adjust=False).mean()
-        feats[f'trend_dev_{p}'] = (c - ema) / (ema + 1e-8) * 100
-
-    # Mean reversion score: z-score of return over rolling window
-    for p in [20, 60]:
-        rm = ret.rolling(p)
-        feats[f'ret_zscore_{p}'] = (ret - rm.mean()) / (rm.std() + 1e-8)
-
-    # ── Moving average distances (kept from v4) ──
-    for p in [5, 10, 20, 50, 100, 200]:
-        sma = c.rolling(p, min_periods=p).mean()
-        feats[f'sma_{p}'] = (c - sma) / (sma + 1e-8) * 100
-
-    # SMA slopes
-    for p in [20, 50, 100]:
-        sma = c.rolling(p, min_periods=p).mean()
-        feats[f'sma_{p}_slope'] = sma.pct_change(5) * 100
-
-    # ── NEW: SMA crossover signals ──
-    sma_20 = c.rolling(20).mean()
-    sma_50 = c.rolling(50).mean()
-    sma_200 = c.rolling(200).mean()
-    feats['sma_20_50_cross'] = (sma_20 - sma_50) / (sma_50 + 1e-8) * 100
-    feats['sma_50_200_cross'] = (sma_50 - sma_200) / (sma_200 + 1e-8) * 100
-
-    # ── EMA distances ──
-    for p in [12, 26, 50]:
-        ema = c.ewm(span=p, adjust=False).mean()
-        feats[f'ema_{p}'] = (c - ema) / (ema + 1e-8) * 100
-
-    # ── RSI ──
-    for p in [5, 14, 21]:
-        delta = c.diff()
-        up = delta.clip(lower=0)
-        down = (-delta).clip(lower=0)
-        rs = up.rolling(p).mean() / (down.rolling(p).mean() + 1e-8)
-        feats[f'rsi_{p}'] = 100 - 100 / (1 + rs)
-
-    # ── MACD ──
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_signal = macd.ewm(span=9, adjust=False).mean()
-    feats['macd_hist'] = (macd - macd_signal) / (c + 1e-8) * 100
-
-    # ── Volatility ──
-    for p in [5, 10, 20, 60]:
-        feats[f'vol_{p}'] = ret.rolling(p).std() * np.sqrt(252)
-
-    # ── NEW: Volatility ratio (short/long — rising vol signal) ──
-    feats['vol_ratio_5_20'] = (ret.rolling(5).std()) / (ret.rolling(20).std() + 1e-8)
-    feats['vol_ratio_10_60'] = (ret.rolling(10).std()) / (ret.rolling(60).std() + 1e-8)
-
-    # ── Bollinger %B ──
-    for p in [10, 20]:
-        mid = c.rolling(p).mean()
-        std = c.rolling(p).std()
-        feats[f'bb_{p}'] = (c - (mid - 2 * std)) / (4 * std + 1e-8)
-
-    # ── ATR ──
-    tr = pd.concat([h - lo, (h - c.shift(1)).abs(), (lo - c.shift(1)).abs()], axis=1).max(axis=1)
-    for p in [5, 14, 20]:
-        feats[f'atr_{p}'] = tr.rolling(p).mean() / (c + 1e-8) * 100
-
-    # ── Volume features ──
-    v_sma20 = v.rolling(20).mean()
-    feats['vol_ratio'] = v / (v_sma20 + 1e-8)
-    feats['vol_trend'] = v.rolling(5).mean() / (v_sma20 + 1e-8)
-
-    # OBV trend
-    obv = (v * ret.apply(np.sign)).cumsum()
-    obv_sma = obv.rolling(20).mean()
-    feats['obv_trend'] = (obv - obv_sma) / (obv_sma.abs() + 1e-8)
-
-    # ── NEW: Volume-price divergence ──
-    feats['vp_divergence'] = feats['vol_ratio'] - (1 + ret.rolling(5).mean() * 10)
-
-    # ── NEW: Accumulation/Distribution ──
-    clv = ((c - lo) - (h - c)) / (h - lo + 1e-8)
-    ad = (clv * v).cumsum()
-    ad_sma = ad.rolling(20).mean()
-    feats['ad_trend'] = (ad - ad_sma) / (ad_sma.abs() + 1e-8)
-
-    # ── Statistical ──
-    for p in [20, 60]:
-        feats[f'skew_{p}'] = ret.rolling(p).skew()
-        feats[f'kurt_{p}'] = ret.rolling(p).kurt()
-
-    # ── Sharpe ──
-    for p in [20, 60]:
-        rm = ret.rolling(p)
-        feats[f'sharpe_{p}'] = (rm.mean() / (rm.std() + 1e-8)) * np.sqrt(252)
-
-    # ── Channel position ──
-    for p in [10, 20, 40, 60]:
-        ch_h = h.rolling(p).max()
-        ch_l = lo.rolling(p).min()
-        feats[f'channel_{p}'] = (c - ch_l) / (ch_h - ch_l + 1e-8)
-
-    # ── Distance from highs/lows ──
-    for p in [20, 60, 120]:
-        feats[f'dist_hi_{p}'] = (c - h.rolling(p).max()) / (c + 1e-8) * 100
-        feats[f'dist_lo_{p}'] = (c - lo.rolling(p).min()) / (c + 1e-8) * 100
-
-    # ── Intraday ──
-    feats['day_range'] = (h - lo) / (c + 1e-8) * 100
-    feats['close_loc'] = (c - lo) / (h - lo + 1e-8)
-
-    # ── NEW: Gap features ──
-    feats['gap'] = (df['open'].astype(float) / c.shift(1) - 1) * 100 if 'open' in df.columns else 0
-
-    # ── NEW: Relative volume intensity ──
-    feats['dollar_vol_20'] = (c * v).rolling(20).mean()
-    dv = feats['dollar_vol_20']
-    feats['dollar_vol_ratio'] = (c * v) / (dv + 1e-8) if isinstance(dv, pd.Series) else 1
-
-    # ── Calendar ──
-    if hasattr(df.index, 'dayofweek'):
-        dow = df.index.dayofweek
-        feats['dow_sin'] = pd.Series(np.sin(2 * np.pi * dow / 5), index=df.index)
-        feats['dow_cos'] = pd.Series(np.cos(2 * np.pi * dow / 5), index=df.index)
-    if hasattr(df.index, 'month'):
-        m = df.index.month
-        feats['month_sin'] = pd.Series(np.sin(2 * np.pi * m / 12), index=df.index)
-        feats['month_cos'] = pd.Series(np.cos(2 * np.pi * m / 12), index=df.index)
-
-    result = pd.DataFrame(feats, index=df.index)
-
-    # Drop the intermediate dollar_vol_20 column (not a real feature)
-    if 'dollar_vol_20' in result.columns:
-        result.drop('dollar_vol_20', axis=1, inplace=True)
-
-    # Downcast to float32
-    for col in result.columns:
-        result[col] = result[col].astype(np.float32)
-
-    return result
-
-
 def compute_macro_features(macro_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Compute market-level features — identical to training pipeline."""
     feats = {}
@@ -825,100 +745,43 @@ def compute_macro_features(macro_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ENSEMBLE MODEL (needed for v5 pickle deserialization)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class EnsembleModel:
-    """Weighted ensemble that mimics sklearn predict interface."""
-    def __init__(self, models):
-        self.models = models
-    def predict(self, X):
-        total_weight = sum(w for _, _, w in self.models)
-        preds = np.zeros(len(X))
-        for name, model, weight in self.models:
-            preds += model.predict(X) * weight
-        return preds / total_weight
-    @property
-    def feature_importances_(self):
-        total_weight = sum(w for _, _, w in self.models)
-        imp = np.zeros_like(self.models[0][1].feature_importances_, dtype=float)
-        for name, model, weight in self.models:
-            imp += model.feature_importances_ * weight
-        return imp / total_weight
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # PREDICTION
 # ═══════════════════════════════════════════════════════════════════════════
 
 def predict_rankings(
     stock_data: dict, macro_features: pd.DataFrame,
     model, feature_cols: list, logger, report: RunReport,
-    feature_version: str = "v4",
 ) -> list[tuple[str, float]]:
     """Generate predictions for all stocks, return sorted rankings."""
     report.start_step("predict")
-
-    # Select feature computation based on version
-    feat_fn = compute_stock_features_v5 if feature_version == "v5" else compute_stock_features
-
-    # Step 1: Compute features for all stocks
-    all_stock_features = {}
+    predictions = {}
     failures = []
 
     for sym, df in stock_data.items():
         try:
-            stock_feats = feat_fn(df)
+            stock_feats = compute_stock_features(df)
+
+            # Merge with macro
             if not macro_features.empty:
                 merged = stock_feats.join(macro_features, how="left")
                 macro_cols = macro_features.columns
                 merged[macro_cols] = merged[macro_cols].ffill()
             else:
                 merged = stock_feats
-            all_stock_features[sym] = merged
-        except Exception as e:
-            failures.append((sym, str(e)))
 
-    logger.info(f"  Features computed for {len(all_stock_features)} stocks ({feature_version})")
-
-    # Step 2: Cross-sectional ranking (v5 only)
-    cs_ranks = None
-    if feature_version == "v5":
-        rank_prefixes = ['ret_', 'sma_', 'rsi_', 'vol_', 'sharpe_', 'channel_', 'bb_', 'resid_', 'trend_dev']
-        latest_vals = {}
-        for sym, merged in all_stock_features.items():
-            latest_vals[sym] = merged.iloc[-1]
-
-        cs_df = pd.DataFrame(latest_vals).T
-        cs_rank_cols = {}
-        for col in cs_df.columns:
-            if any(col.startswith(p) for p in rank_prefixes):
-                cs_rank_cols[f'cs_{col}'] = cs_df[col].rank(pct=True)
-
-        cs_ranks = pd.DataFrame(cs_rank_cols, index=cs_df.index)
-        logger.info(f"  Cross-sectional ranks: {len(cs_rank_cols)} features ranked across {len(cs_df)} stocks")
-
-    # Step 3: Predict
-    predictions = {}
-    for sym, merged in all_stock_features.items():
-        try:
+            # Get latest row
             latest = merged.iloc[-1:]
             avail_cols = [c for c in feature_cols if c in merged.columns]
 
-            if len(avail_cols) < len(feature_cols) * 0.5:
+            if len(avail_cols) < len(feature_cols) * 0.9:
                 failures.append((sym, "too many missing features"))
                 continue
 
-            row = latest[avail_cols].copy()
-
-            # Add cross-sectional rank features (v5 only)
-            if cs_ranks is not None and sym in cs_ranks.index:
-                for rc in cs_ranks.columns:
-                    row[rc] = cs_ranks.loc[sym, rc]
-
+            row = latest[avail_cols]
             if row.isna().any(axis=1).iloc[0]:
                 row = row.fillna(0)
 
+            # Ensure column order matches training
             missing = [c for c in feature_cols if c not in row.columns]
             for mc in missing:
                 row[mc] = 0
@@ -929,6 +792,7 @@ def predict_rankings(
                 predictions[sym] = float(pred)
             else:
                 failures.append((sym, "non-finite prediction"))
+
         except Exception as e:
             failures.append((sym, str(e)))
 
@@ -939,6 +803,7 @@ def predict_rankings(
         for sym, reason in failures:
             logger.info(f"    SKIP {sym}: {reason}")
 
+    # Prediction distribution stats
     if predictions:
         preds_arr = np.array(list(predictions.values()))
         report.set("prediction_range", {
@@ -965,21 +830,27 @@ def predict_rankings(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ALPACA TRADING
+# ALPACA TRADING (with structured trade logging)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def get_alpaca_headers(model_config):
-    return model_config.get_headers()
+def _make_alpaca_headers(mc: ModelConfig) -> dict:
+    """Build Alpaca auth headers for a specific model's credentials."""
+    return {
+        "APCA-API-KEY-ID": mc.alpaca_key,
+        "APCA-API-SECRET-KEY": mc.alpaca_secret,
+        "Content-Type": "application/json",
+    }
 
 
-def alpaca_request(method: str, endpoint: str, data=None, logger=None, model_config=None):
-    """Make an Alpaca API request with logging."""
+def alpaca_request(method: str, endpoint: str, mc: ModelConfig,
+                   data=None, logger=None):
+    """Make an Alpaca API request with per-model credentials."""
     import requests
-    url = f"{ALPACA_BASE_URL}/{endpoint}"
-    headers = model_config.get_headers() if model_config else {}
+    url = f"{mc.alpaca_base_url}/{endpoint}"
+    headers = _make_alpaca_headers(mc)
 
     if logger:
-        logger.info(f"    API: {method} {endpoint}")
+        logger.info(f"    API [{mc.name}]: {method} {endpoint}")
 
     if method == "GET":
         resp = requests.get(url, headers=headers)
@@ -1001,13 +872,13 @@ def alpaca_request(method: str, endpoint: str, data=None, logger=None, model_con
     return resp.json()
 
 
-def get_account(logger, report: RunReport, model_config):
-    """Get Alpaca account info."""
-    acct = alpaca_request("GET", "v2/account", logger=logger, model_config=model_config)
+def get_account(mc: ModelConfig, logger, report: RunReport):
+    """Get Alpaca account info for a model."""
+    acct = alpaca_request("GET", "v2/account", mc, logger=logger)
     pv = float(acct["portfolio_value"])
     cash = float(acct["cash"])
     bp = float(acct["buying_power"])
-    logger.info(f"  Account: portfolio=${pv:,.2f}, "
+    logger.info(f"  Account [{mc.name}]: portfolio=${pv:,.2f}, "
                 f"cash=${cash:,.2f}, buying_power=${bp:,.2f}")
     report.data.setdefault("rebalance", {}).update({
         "portfolio_value": pv, "cash": cash, "buying_power": bp,
@@ -1015,9 +886,9 @@ def get_account(logger, report: RunReport, model_config):
     return acct
 
 
-def get_positions(logger, model_config) -> dict[str, dict]:
-    """Get current positions with details."""
-    positions = alpaca_request("GET", "v2/positions", logger=logger, model_config=model_config)
+def get_positions(mc: ModelConfig, logger) -> dict[str, dict]:
+    """Get current positions with details for a model."""
+    positions = alpaca_request("GET", "v2/positions", mc, logger=logger)
     pos_dict = {}
     total_value = 0
     total_pl = 0
@@ -1037,43 +908,47 @@ def get_positions(logger, model_config) -> dict[str, dict]:
         total_value += mv
         total_pl += pl
 
-    logger.info(f"  Current positions: {len(pos_dict)} stocks, "
+    logger.info(f"  Positions [{mc.name}]: {len(pos_dict)} stocks, "
                 f"value=${total_value:,.2f}, unrealized P&L=${total_pl:,.2f}")
 
     if pos_dict:
-        # Show each position
         for sym, info in sorted(pos_dict.items()):
-            logger.info(f"    {sym:6s}: {info['qty']:>8.2f} shares, "
-                        f"${info['market_value']:>10,.2f}, "
-                        f"P&L: ${info['unrealized_pl']:>+8,.2f} "
+            logger.info(f"    {sym:6s}: {info['qty']:>8.2f} shares @ "
+                        f"${info['avg_entry']:>8.2f} -> ${info['current_price']:>8.2f}, "
+                        f"val=${info['market_value']:>10,.2f}, "
+                        f"P&L=${info['unrealized_pl']:>+8,.2f} "
                         f"({info['unrealized_pl_pct']:>+5.1f}%)")
 
     return pos_dict
 
 
 def rebalance_portfolio(
-    target_symbols: list[str], logger, report: RunReport,
-    dry_run: bool = False, model_config=None,
+    target_symbols: list[str],
+    rankings: list[tuple[str, float]],
+    mc: ModelConfig,
+    journal: TradeJournal,
+    logger,
+    report: RunReport,
+    dry_run: bool = False,
 ):
-    """Rebalance to equal-weight long portfolio of target symbols."""
+    """Rebalance to equal-weight long portfolio with full trade logging."""
     report.start_step("rebalance")
     rb_data = report.data.setdefault("rebalance", {})
     rb_data["dry_run"] = dry_run
 
-    if dry_run:
-        # In dry-run mode, use mock account data so we don't need Alpaca credentials
-        logger.info("  DRY RUN: using mock account (portfolio=$100,000)")
-        portfolio_value = 100_000.0
-        current_positions = {}
-        rb_data["portfolio_value"] = portfolio_value
-        rb_data["cash"] = portfolio_value
-        rb_data["buying_power"] = portfolio_value
-        rb_data["positions_before"] = 0
-    else:
-        acct = get_account(logger, report, model_config)
-        portfolio_value = float(acct["portfolio_value"])
-        current_positions = get_positions(logger, model_config)
-        rb_data["positions_before"] = len(current_positions)
+    # Build prediction lookup: symbol -> (predicted_return, rank)
+    pred_lookup = {}
+    for rank_idx, (sym, pred) in enumerate(rankings):
+        pred_lookup[sym] = (pred, rank_idx + 1)
+
+    # Generate a unique run_id for this rebalance cycle
+    run_id = f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    acct = get_account(mc, logger, report)
+    portfolio_value = float(acct["portfolio_value"])
+    cash_available = float(acct["cash"])
+    current_positions = get_positions(mc, logger)
+    rb_data["positions_before"] = len(current_positions)
 
     target_set = set(target_symbols)
     current_set = set(current_positions.keys())
@@ -1085,53 +960,91 @@ def rebalance_portfolio(
     target_weight = portfolio_value / len(target_symbols)
     rb_data["target_weight"] = target_weight
 
+    # Turnover calculation
+    total_positions = max(len(target_set) + len(current_set), 1)
+    turnover = (len(to_sell) + len(to_buy)) / total_positions
+
     orders = []
     n_rebalanced = 0
     n_held_unchanged = 0
 
-    # 1. Sell positions not in target
-    logger.info(f"\n  Sells ({len(to_sell)} positions to exit):")
+    # -- 1. Sell positions not in target --
+    logger.info(f"\n  SELLS - {len(to_sell)} positions to exit:")
     for sym in to_sell:
-        qty = current_positions[sym]["qty"]
-        mv = current_positions[sym]["market_value"]
-        pl = current_positions[sym]["unrealized_pl"]
-        logger.info(f"    SELL {sym}: {qty:.2f} shares, "
-                    f"${mv:,.2f}, P&L: ${pl:+,.2f}")
-        if not dry_run:
-            orders.append(("sell", sym, qty))
+        pos = current_positions[sym]
+        qty = pos["qty"]
+        mv = pos["market_value"]
+        pl = pos["unrealized_pl"]
+        pl_pct = pos["unrealized_pl_pct"]
+        entry = pos["avg_entry"]
+        price = pos["current_price"]
 
-    # 2. Check held positions — rebalance if needed
-    logger.info(f"\n  Holds ({len(to_hold)} positions to check):")
+        logger.info(f"    EXIT  {sym:6s}: {qty:>8.2f} shares, "
+                    f"entry=${entry:.2f} -> now=${price:.2f}, "
+                    f"val=${mv:,.2f}, P&L=${pl:+,.2f} ({pl_pct:+.1f}%)")
+
+        if not dry_run:
+            orders.append({
+                "action": "sell", "symbol": sym, "qty": qty,
+                "notional": mv, "side": "sell",
+                "trade_action": "exit_position",
+                "entry_price": entry, "current_price": price,
+                "position_value_before": mv,
+                "unrealized_pnl_usd": pl, "unrealized_pnl_pct": pl_pct,
+            })
+
+    # -- 2. Check held positions — rebalance if needed --
+    logger.info(f"\n  HOLDS - {len(to_hold)} positions to check:")
     for sym in to_hold:
-        current_value = current_positions[sym]["market_value"]
+        pos = current_positions[sym]
+        current_value = pos["market_value"]
         diff = target_weight - current_value
         drift_pct = abs(diff) / target_weight * 100
+        pred_ret, rank = pred_lookup.get(sym, (None, None))
+        pred_str = f", pred={pred_ret:+.2f}% rank=#{rank}" if pred_ret is not None else ""
 
         if abs(diff) > target_weight * 0.1:
-            direction = "BUY more" if diff > 0 else "TRIM"
-            logger.info(f"    REBALANCE {sym}: ${current_value:,.0f} → "
-                        f"${target_weight:,.0f} (drift: {drift_pct:.0f}%, {direction} ${abs(diff):,.0f})")
+            if diff > 0:
+                direction = "BUY more"
+                trade_action = "rebalance_up"
+            else:
+                direction = "TRIM"
+                trade_action = "rebalance_down"
+
+            logger.info(f"    REBAL {sym:6s}: ${current_value:,.0f} -> ${target_weight:,.0f} "
+                        f"(drift {drift_pct:.0f}%, {direction} ${abs(diff):,.0f}{pred_str})")
             n_rebalanced += 1
+
             if not dry_run:
-                if diff > 0:
-                    orders.append(("buy_notional", sym, diff))
-                else:
-                    orders.append(("sell_notional", sym, abs(diff)))
+                side = "buy" if diff > 0 else "sell"
+                orders.append({
+                    "action": f"{side}_notional", "symbol": sym,
+                    "notional": abs(diff), "side": side,
+                    "trade_action": trade_action,
+                    "entry_price": pos["avg_entry"],
+                    "current_price": pos["current_price"],
+                    "position_value_before": current_value,
+                    "predicted_return": pred_ret, "rank": rank,
+                })
         else:
-            logger.info(f"    HOLD {sym}: ${current_value:,.0f} "
-                        f"(drift: {drift_pct:.0f}%, within 10% — no action)")
+            logger.info(f"    HOLD  {sym:6s}: ${current_value:,.0f} "
+                        f"(drift {drift_pct:.0f}% < 10%, no action{pred_str})")
             n_held_unchanged += 1
 
-    # 3. Buy new positions
-    logger.info(f"\n  Buys ({len(to_buy)} new positions):")
+    # -- 3. Buy new positions --
+    logger.info(f"\n  BUYS - {len(to_buy)} new positions:")
     for sym in to_buy:
-        logger.info(f"    BUY {sym}: ${target_weight:,.0f} (new position)")
-        if not dry_run:
-            orders.append(("buy_notional", sym, target_weight))
+        pred_ret, rank = pred_lookup.get(sym, (None, None))
+        pred_str = f"pred={pred_ret:+.2f}%, rank=#{rank}" if pred_ret is not None else ""
+        logger.info(f"    NEW   {sym:6s}: ${target_weight:,.0f} ({pred_str})")
 
-    # Turnover calculation
-    total_positions = max(len(target_set) + len(current_set), 1)
-    turnover = (len(to_sell) + len(to_buy)) / total_positions
+        if not dry_run:
+            orders.append({
+                "action": "buy_notional", "symbol": sym,
+                "notional": target_weight, "side": "buy",
+                "trade_action": "new_position",
+                "predicted_return": pred_ret, "rank": rank,
+            })
 
     rb_data.update({
         "n_sells": len(to_sell), "n_buys": len(to_buy),
@@ -1140,68 +1053,136 @@ def rebalance_portfolio(
         "turnover": turnover,
     })
 
-    logger.info(f"\n  Summary: {len(to_sell)} sells, {len(to_buy)} buys, "
+    logger.info(f"\n  Summary: {len(to_sell)} exits, {len(to_buy)} new buys, "
                 f"{n_rebalanced} rebalanced, {n_held_unchanged} held, "
                 f"turnover: {turnover:.0%}")
 
     if dry_run:
-        logger.info("  MODE: DRY RUN — no orders sent")
+        logger.info("  MODE: DRY RUN - no orders sent, no trades logged")
         report.end_step("rebalance")
         return rb_data
 
-    # Execute orders
+    # -- Execute orders + log each trade --
     logger.info(f"\n  Executing {len(orders)} orders...")
     executed = 0
     failed = 0
+    trade_count = 0
+    total_notional = 0.0
+    buy_notional = 0.0
+    sell_notional = 0.0
 
-    for action, sym, amount in orders:
+    for order in orders:
+        sym = order["symbol"]
+        trade_ts = datetime.now(timezone.utc).isoformat()
+        trade_id = f"{mc.name}_{trade_ts.replace(':', '').replace('-', '')}_{sym}_{order['side']}"
+
+        # Build trade record
+        trade = TradeRecord(
+            trade_id=trade_id,
+            run_id=run_id,
+            model=mc.name,
+            timestamp=trade_ts,
+            symbol=sym,
+            side=order["side"],
+            action=order["trade_action"],
+            order_type="market",
+            time_in_force="day",
+            notional_usd=round(order["notional"], 2),
+            predicted_return_pct=order.get("predicted_return"),
+            rank=order.get("rank"),
+            target_weight_usd=round(target_weight, 2),
+            entry_price=order.get("entry_price"),
+            current_price=order.get("current_price"),
+            unrealized_pnl_usd=order.get("unrealized_pnl_usd"),
+            unrealized_pnl_pct=order.get("unrealized_pnl_pct"),
+            position_value_before=order.get("position_value_before"),
+            portfolio_value=round(portfolio_value, 2),
+            cash_before=round(cash_available, 2),
+            total_positions=len(target_symbols),
+            rebalance_turnover_pct=round(turnover * 100, 1),
+        )
+
         try:
-            if action == "sell":
-                alpaca_request("DELETE", f"v2/positions/{sym}", logger=logger, model_config=model_config)
-                logger.info(f"    OK: closed {sym}")
-            elif action == "buy_notional":
-                resp = alpaca_request("POST", "v2/orders", {
-                    "symbol": sym, "notional": round(amount, 2),
-                    "side": "buy", "type": "market", "time_in_force": "day",
-                }, logger=logger, model_config=model_config)
-                logger.info(f"    OK: buy {sym} ${amount:,.2f} "
-                            f"(order: {resp.get('id', '?')})")
-            elif action == "sell_notional":
-                resp = alpaca_request("POST", "v2/orders", {
-                    "symbol": sym, "notional": round(amount, 2),
-                    "side": "sell", "type": "market", "time_in_force": "day",
-                }, logger=logger, model_config=model_config)
-                logger.info(f"    OK: sell {sym} ${amount:,.2f} "
-                            f"(order: {resp.get('id', '?')})")
+            if order["action"] == "sell":
+                # Close entire position
+                alpaca_request("DELETE", f"v2/positions/{sym}", mc, logger=logger)
+                trade.order_status = "submitted"
+                trade.shares = order["qty"]
+                logger.info(f"    OK  EXIT  {sym:6s}: closed {order['qty']:.2f} shares, "
+                            f"P&L=${order.get('unrealized_pnl_usd', 0):+,.2f} "
+                            f"({order.get('unrealized_pnl_pct', 0):+.1f}%)")
+
+            elif order["action"] in ("buy_notional", "sell_notional"):
+                # Fractional notional order
+                resp = alpaca_request("POST", "v2/orders", mc, {
+                    "symbol": sym,
+                    "notional": round(order["notional"], 2),
+                    "side": order["side"],
+                    "type": "market",
+                    "time_in_force": "day",
+                }, logger=logger)
+                trade.order_id = resp.get("id")
+                trade.order_status = resp.get("status", "submitted")
+                logger.info(
+                    f"    OK  {order['trade_action'].upper():16s} {sym:6s}: "
+                    f"{order['side']} ${order['notional']:,.2f}, "
+                    f"order_id={resp.get('id', '?')}, "
+                    f"status={resp.get('status', '?')}"
+                )
+
             executed += 1
-            time.sleep(0.1)
+            total_notional += order["notional"]
+            if order["side"] == "buy":
+                buy_notional += order["notional"]
+            else:
+                sell_notional += order["notional"]
+
         except Exception as e:
-            logger.error(f"    FAIL: {action} {sym} — {e}")
-            report.add_error(f"Order failed: {action} {sym} — {e}")
+            trade.order_status = "failed"
+            trade.error_message = str(e)
+            logger.error(f"    FAIL {order['trade_action'].upper():16s} {sym:6s}: {e}")
+            report.add_error(f"Order failed: {order['trade_action']} {sym} - {e}")
             failed += 1
 
+        # Log trade to journal regardless of success/failure
+        journal.log_trade(trade)
+        trade_count += 1
+        time.sleep(0.1)
+
     rb_data.update({"executed": executed, "failed": failed})
-    logger.info(f"  Orders done: {executed} executed, {failed} failed")
+    report.set("trade_log_summary", {
+        "count": trade_count,
+        "total_notional": round(total_notional, 2),
+        "buy_notional": round(buy_notional, 2),
+        "sell_notional": round(sell_notional, 2),
+        "file": str(journal.jsonl_path),
+    })
+
+    logger.info(f"\n  Orders done: {executed} submitted, {failed} failed")
+    logger.info(f"  Trade journal: {trade_count} trades logged -> {journal.jsonl_path}")
+    logger.info(f"  Notional: ${total_notional:,.2f} total "
+                f"(${buy_notional:,.2f} buys, ${sell_notional:,.2f} sells)")
+
     report.end_step("rebalance")
     return rb_data
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STATE MANAGEMENT
+# STATE MANAGEMENT (per-model)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def load_state(state_path: Path) -> dict:
-    """Load pipeline state from JSON."""
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    if state_path.exists():
-        return json.loads(state_path.read_text())
+def load_state(mc: ModelConfig) -> dict:
+    """Load pipeline state from JSON for a specific model."""
+    mc.state_path.parent.mkdir(parents=True, exist_ok=True)
+    if mc.state_path.exists():
+        return json.loads(mc.state_path.read_text())
     return {"last_rebalance": None, "last_run": None, "run_count": 0, "history": []}
 
 
-def save_state(state: dict, state_path: Path):
-    """Save pipeline state to JSON."""
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, indent=2, default=str))
+def save_state(state: dict, mc: ModelConfig):
+    """Save pipeline state to JSON for a specific model."""
+    mc.state_path.parent.mkdir(parents=True, exist_ok=True)
+    mc.state_path.write_text(json.dumps(state, indent=2, default=str))
 
 
 def should_rebalance(state: dict, force: bool = False) -> bool:
@@ -1217,140 +1198,187 @@ def should_rebalance(state: dict, force: bool = False) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MAIN PIPELINE
+# MAIN PIPELINE — runs per model
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_pipeline(dry_run: bool = False, force: bool = False, model_filter: str = None):
-    """Execute pipeline for all active models."""
-    logger, log_file = setup_logging()
+def run_single_model(
+    mc: ModelConfig,
+    stock_data: dict,
+    macro_features: pd.DataFrame,
+    dry_run: bool = False,
+    force: bool = False,
+):
+    """Execute the pipeline for one model."""
+    logger, log_file = setup_logging(mc.name)
     report = RunReport()
-
-    active_models = get_active_models()
-    if model_filter:
-        active_models = [m for m in active_models if m.name == model_filter]
+    journal = TradeJournal(mc.name)
 
     logger.info("=" * 70)
-    logger.info(f"  ML TRADING PIPELINE — Multi-Model")
+    logger.info(f"  ML TRADING PIPELINE - Model: {mc.name.upper()}")
     logger.info(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"  Active models: {[m.name for m in active_models]}")
     logger.info(f"  Config: H{HORIZON}_LongOnly{TOP_N}")
     logger.info(f"  Mode: {'DRY RUN' if dry_run else 'LIVE PAPER TRADING'}")
+    logger.info(f"  Force rebalance: {force}")
+    logger.info(f"  Log: {log_file}")
+    logger.info(f"  Trade journal: {journal.jsonl_path}")
     logger.info("=" * 70)
 
-    if not active_models:
-        logger.error("No models configured! Set MODEL_V4_ALPACA_KEY/SECRET or MODEL_V5_ALPACA_KEY/SECRET")
+    # -- Step 1: Load model --
+    logger.info("\n[1/5] LOADING MODEL")
+    report.start_step("load_model")
+    if not mc.model_path.exists():
+        logger.error(f"Model not found: {mc.model_path}")
+        report.add_error(f"Model not found: {mc.model_path}")
+        logger.info(report.format_summary())
         return
 
-    # ── Download data ONCE (shared across all models) ──
-    logger.info("\n[SHARED] DOWNLOADING MARKET DATA")
+    model_bundle = pickle.load(open(mc.model_path, "rb"))
+    model = model_bundle["model"]
+    feature_cols = model_bundle["feature_cols"]
+    logger.info(f"  Model: {len(feature_cols)} features, "
+                f"horizon={model_bundle.get('horizon', '?')}d, "
+                f"task={model_bundle.get('task', '?')}")
+    logger.info(f"  Trained: {model_bundle.get('saved_at', '?')}")
+    report.set("n_features", len(feature_cols))
+    report.end_step("load_model")
+
+    # -- Step 2: Check state --
+    state = load_state(mc)
+    logger.info(f"\n  State: run #{state.get('run_count', 0) + 1}, "
+                f"last rebalance: {state.get('last_rebalance', 'never')}")
+
+    if not should_rebalance(state, force):
+        last = datetime.fromisoformat(state["last_rebalance"])
+        days_since = (datetime.now() - last).days
+        days_until = HORIZON - days_since
+        logger.info(f"  Skipping - last rebalance {days_since}d ago, "
+                     f"next in {days_until}d")
+        state["last_run"] = datetime.now().isoformat()
+        save_state(state, mc)
+        logger.info(report.format_summary())
+        return
+
+    # -- Step 3: Compute features (data already downloaded) --
+    logger.info("\n[3/5] COMPUTING FEATURES")
+    report.start_step("compute_features")
+    logger.info(f"  Using {len(stock_data)} stocks, "
+                f"{len(macro_features.columns)} macro features")
+    report.set("stocks_downloaded", len(stock_data))
+    report.end_step("compute_features")
+
+    # -- Step 4: Generate predictions --
+    logger.info("\n[4/5] GENERATING PREDICTIONS")
+    rankings = predict_rankings(
+        stock_data, macro_features, model, feature_cols, logger, report,
+    )
+
+    if len(rankings) < TOP_N:
+        logger.error(f"Only {len(rankings)} predictions - need at least {TOP_N}")
+        report.add_error(f"Insufficient predictions: {len(rankings)} < {TOP_N}")
+        logger.info(report.format_summary())
+        return
+
+    target_symbols = [sym for sym, _ in rankings[:TOP_N]]
+    report.set("target_portfolio", rankings[:TOP_N])
+
+    logger.info(f"\n  Target portfolio ({TOP_N} stocks):")
+    for i, (sym, pred) in enumerate(rankings[:TOP_N]):
+        logger.info(f"    {i+1:2d}. {sym:6s}  pred={pred:+6.2f}%")
+
+    # -- Step 5: Rebalance --
+    logger.info("\n[5/5] REBALANCING PORTFOLIO")
+    result = rebalance_portfolio(
+        target_symbols, rankings, mc, journal, logger, report, dry_run=dry_run
+    )
+
+    # -- Save state --
+    state["last_rebalance"] = datetime.now().isoformat()
+    state["last_run"] = datetime.now().isoformat()
+    state["run_count"] = state.get("run_count", 0) + 1
+    state["history"].append({
+        "date": datetime.now().isoformat(),
+        "run_id": f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
+        "target_symbols": target_symbols,
+        "predictions": {s: round(p, 4) for s, p in rankings[:TOP_N]},
+        "result": {k: v for k, v in result.items()
+                   if k not in ("sells_detail", "buys_detail")},
+    })
+    state["history"] = state["history"][-100:]
+    save_state(state, mc)
+
+    # -- Final summary --
+    summary = report.format_summary()
+    logger.info(summary)
+    logger.info(f"Log saved to: {log_file}")
+
+
+def run_pipeline(dry_run: bool = False, force: bool = False,
+                 model_filter: str = None):
+    """Execute the full daily pipeline for all active models."""
+    logger, log_file = setup_logging("main")
+
+    # -- Discover models --
+    models = get_active_models()
+    if model_filter:
+        models = [m for m in models if m.name == model_filter]
+
+    if not models:
+        logger.error("No active models found. Set MODEL_V4_ALPACA_KEY/SECRET "
+                     "(or ALPACA_API_KEY/SECRET) and ensure model files exist.")
+        sys.exit(1)
+
+    logger.info(f"Active models: {[m.name for m in models]}")
+
+    # -- Download data once (shared across models) --
+    report = RunReport()
+
+    logger.info("\n[1/2] DOWNLOADING MARKET DATA (shared)")
     symbols = get_tradeable_symbols(logger, report)
     if not symbols:
-        logger.error("No symbols found")
-        return
+        logger.error("No symbols found - cannot proceed")
+        sys.exit(1)
 
     stock_data = download_bars(symbols, LOOKBACK_DAYS, logger, report)
     macro_data = download_macro(LOOKBACK_DAYS, logger, report)
 
     if not stock_data:
-        logger.error("No stock data downloaded")
-        return
+        logger.error("No stock data downloaded - cannot proceed")
+        sys.exit(1)
 
-    logger.info("\n[SHARED] COMPUTING MACRO FEATURES")
-    report.start_step("compute_features")
+    logger.info("\n[2/2] COMPUTING MACRO FEATURES (shared)")
     macro_features = compute_macro_features(macro_data)
-    logger.info(f"  Macro features: {len(macro_features.columns)} columns")
-    report.end_step("compute_features")
+    logger.info(f"  Macro features: {len(macro_features.columns)} columns, "
+                f"{len(macro_features)} days")
 
-    # ── Run each model independently ──
-    for mc in active_models:
+    # -- Run each model --
+    for mc in models:
         logger.info(f"\n{'=' * 70}")
-        logger.info(f"  MODEL: {mc.name.upper()} ({mc.feature_version})")
+        logger.info(f"  Running model: {mc.name.upper()}")
         logger.info(f"{'=' * 70}")
+        try:
+            run_single_model(mc, stock_data, macro_features,
+                             dry_run=dry_run, force=force)
+        except Exception as e:
+            logger.error(f"Model {mc.name} FAILED: {e}\n{traceback.format_exc()}")
 
-        model_report = RunReport()
-
-        # Check credentials
-        if not dry_run and not mc.has_credentials:
-            logger.warning(f"  [{mc.name}] No Alpaca credentials — skipping")
-            continue
-
-        # Load model
-        logger.info(f"\n  [{mc.name}] Loading model...")
-        if not mc.model_path.exists():
-            logger.error(f"  [{mc.name}] Model not found: {mc.model_path}")
-            continue
-
-        model_bundle = pickle.load(open(mc.model_path, "rb"))
-        model = model_bundle["model"]
-        feature_cols = model_bundle["feature_cols"]
-        logger.info(f"  [{mc.name}] {len(feature_cols)} features, "
-                    f"horizon={model_bundle['horizon']}d, "
-                    f"version={model_bundle.get('version', mc.feature_version)}")
-
-        # Check state
-        state = load_state(mc.state_path)
-        logger.info(f"  [{mc.name}] Run #{state.get('run_count', 0) + 1}, "
-                    f"last rebalance: {state.get('last_rebalance', 'never')}")
-
-        if not should_rebalance(state, force):
-            last = datetime.fromisoformat(state["last_rebalance"])
-            days_since = (datetime.now() - last).days
-            logger.info(f"  [{mc.name}] Skipping — last rebalance {days_since}d ago")
-            state["last_run"] = datetime.now().isoformat()
-            save_state(state, mc.state_path)
-            continue
-
-        # Generate predictions
-        logger.info(f"\n  [{mc.name}] GENERATING PREDICTIONS")
-        rankings = predict_rankings(
-            stock_data, macro_features, model, feature_cols, logger, model_report,
-            feature_version=mc.feature_version,
-        )
-
-        if len(rankings) < TOP_N:
-            logger.error(f"  [{mc.name}] Only {len(rankings)} predictions — need {TOP_N}")
-            continue
-
-        target_symbols = [sym for sym, _ in rankings[:TOP_N]]
-
-        logger.info(f"\n  [{mc.name}] Target portfolio ({TOP_N} stocks):")
-        for i, (sym, pred) in enumerate(rankings[:TOP_N]):
-            logger.info(f"    {i+1:2d}. {sym:6s}  {pred:+6.2f}%")
-
-        # Rebalance
-        logger.info(f"\n  [{mc.name}] REBALANCING")
-        result = rebalance_portfolio(target_symbols, logger, model_report, dry_run=dry_run, model_config=mc)
-
-        # Save state
-        state["last_rebalance"] = datetime.now().isoformat()
-        state["last_run"] = datetime.now().isoformat()
-        state["run_count"] = state.get("run_count", 0) + 1
-        state["history"].append({
-            "date": datetime.now().isoformat(),
-            "target_symbols": target_symbols,
-            "predictions": {s: round(p, 4) for s, p in rankings[:TOP_N]},
-            "result": {k: v for k, v in result.items()
-                       if k not in ("sells_detail", "buys_detail")},
-        })
-        state["history"] = state["history"][-100:]
-        save_state(state, mc.state_path)
-
-        logger.info(f"\n  [{mc.name}] DONE")
-
-    logger.info(f"\n{'=' * 70}")
-    logger.info(f"ALL MODELS COMPLETE")
-    logger.info(f"Log: {log_file}")
+    logger.info("\nAll models complete.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ML Trading Pipeline — Multi-Model")
-    parser.add_argument("--dry-run", action="store_true", help="Predict only, no orders")
-    parser.add_argument("--force", action="store_true", help="Force rebalance even if not due")
-    parser.add_argument("--model", type=str, default=None, help="Run specific model only (v4, v5)")
+    parser = argparse.ArgumentParser(description="ML Trading Pipeline (Multi-Model)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Predict only, no orders")
+    parser.add_argument("--force", action="store_true",
+                        help="Force rebalance even if not due")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Run a single model only (e.g. v4, v5)")
     args = parser.parse_args()
 
     try:
-        run_pipeline(dry_run=args.dry_run, force=args.force, model_filter=args.model)
+        run_pipeline(dry_run=args.dry_run, force=args.force,
+                     model_filter=args.model)
     except Exception as e:
-        logging.getLogger("pipeline").error(f"FATAL: {e}\n{traceback.format_exc()}")
+        logging.getLogger("pipeline").error(
+            f"FATAL: {e}\n{traceback.format_exc()}"
+        )
         sys.exit(1)
