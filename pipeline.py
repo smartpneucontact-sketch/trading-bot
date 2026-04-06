@@ -1564,7 +1564,15 @@ def run_single_model(
         logger.info(report.format_summary())
         return
 
-    model_bundle = pickle.load(open(mc.model_path, "rb"))
+    # Custom unpickler to resolve classes saved from __main__ (e.g. train_ml_v6.py)
+    class _PipelineUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            # Redirect __main__.StackedEnsemble to this module's class
+            if module == "__main__" and name == "StackedEnsemble":
+                return StackedEnsemble
+            return super().find_class(module, name)
+
+    model_bundle = _PipelineUnpickler(open(mc.model_path, "rb")).load()
     model = model_bundle["model"]
     feature_cols = model_bundle["feature_cols"]
     logger.info(f"  Model: {len(feature_cols)} features, "
