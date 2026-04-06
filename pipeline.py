@@ -923,6 +923,11 @@ def compute_stock_features_v6(df: pd.DataFrame) -> pd.DataFrame:
     feats_df['vol_ratio_5_20'] = (ret.rolling(5).std() / (ret.rolling(20).std() + 1e-8)).astype(np.float32)
     feats_df['vol_ratio_10_60'] = (ret.rolling(10).std() / (ret.rolling(60).std() + 1e-8)).astype(np.float32)
 
+    # Dollar volume ratio (v5 feature)
+    dollar_vol = c * v
+    dollar_vol_sma20 = dollar_vol.rolling(20).mean()
+    feats_df['dollar_vol_ratio'] = (dollar_vol / (dollar_vol_sma20 + 1e-8)).astype(np.float32)
+
     # Volume-price divergence
     v_sma20 = v.rolling(20).mean()
     feats_df['vp_divergence'] = (v / (v_sma20 + 1e-8) - (1 + ret.rolling(5).mean() * 10)).astype(np.float32)
@@ -1071,6 +1076,63 @@ def _get_feature_func(feature_version: str):
 # PREDICTION
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _add_cross_sectional_ranks(
+    latest_rows: dict[str, pd.Series],
+    feature_cols: list[str],
+) -> dict[str, pd.Series]:
+    """Add cross-sectional rank features (cs_*) across all stocks.
+
+    For each base feature that has a cs_ counterpart in feature_cols,
+    compute the percentile rank across all stocks for the latest time point.
+    """
+    # Find which cs_ features are needed
+    cs_cols = [c for c in feature_cols if c.startswith("cs_")]
+    if not cs_cols:
+        return latest_rows
+
+    # Map cs_ col -> base col (e.g. cs_ret_5d -> ret_5d)
+    cs_to_base = {}
+    for cs_col in cs_cols:
+        base_col = cs_col[3:]  # strip "cs_"
+        cs_to_base[cs_col] = base_col
+
+    # Collect base feature values across all stocks
+    syms = list(latest_rows.keys())
+    base_cols_needed = set(cs_to_base.values())
+
+    # Build cross-sectional DataFrame: rows=stocks, cols=base features
+    cs_data = {}
+    for base_col in base_cols_needed:
+        vals = {}
+        for sym in syms:
+            row = latest_rows[sym]
+            if base_col in row.index:
+                vals[sym] = row[base_col]
+        if vals:
+            cs_data[base_col] = pd.Series(vals)
+
+    # Compute percentile ranks
+    cs_ranks = {}
+    for base_col, series in cs_data.items():
+        if len(series) > 1:
+            cs_ranks[base_col] = series.rank(pct=True)
+        else:
+            cs_ranks[base_col] = series * 0 + 0.5  # neutral if only 1 stock
+
+    # Add cs_ features to each stock's row
+    result = {}
+    for sym in syms:
+        row = latest_rows[sym].copy()
+        for cs_col, base_col in cs_to_base.items():
+            if base_col in cs_ranks and sym in cs_ranks[base_col].index:
+                row[cs_col] = np.float32(cs_ranks[base_col][sym])
+            else:
+                row[cs_col] = np.float32(0.5)  # neutral default
+        result[sym] = row
+
+    return result
+
+
 def predict_rankings(
     stock_data: dict, macro_features: pd.DataFrame,
     model, feature_cols: list, logger, report: RunReport,
@@ -1082,6 +1144,11 @@ def predict_rankings(
     failures = []
     feat_func = _get_feature_func(feature_version)
 
+    # Check if cross-sectional features are needed
+    has_cs_features = any(c.startswith("cs_") for c in feature_cols)
+
+    # Step 1: Compute per-stock features and merge with macro
+    latest_rows = {}
     for sym, df in stock_data.items():
         try:
             stock_feats = feat_func(df)
@@ -1095,14 +1162,33 @@ def predict_rankings(
                 merged = stock_feats
 
             # Get latest row
-            latest = merged.iloc[-1:]
-            avail_cols = [c for c in feature_cols if c in merged.columns]
+            latest_rows[sym] = merged.iloc[-1]
+
+        except Exception as e:
+            failures.append((sym, str(e)))
+
+    logger.info(f"  Features computed: {len(latest_rows)} ok, "
+                f"{len(failures)} failed")
+
+    # Step 2: Add cross-sectional ranks if needed
+    if has_cs_features and latest_rows:
+        logger.info(f"  Adding cross-sectional ranks across "
+                    f"{len(latest_rows)} stocks...")
+        latest_rows = _add_cross_sectional_ranks(latest_rows, feature_cols)
+
+    # Step 3: Generate predictions
+    for sym, row_series in latest_rows.items():
+        try:
+            row = row_series.to_frame().T
+            avail_cols = [c for c in feature_cols if c in row.columns]
 
             if len(avail_cols) < len(feature_cols) * 0.9:
-                failures.append((sym, "too many missing features"))
+                missing_count = len(feature_cols) - len(avail_cols)
+                failures.append((sym, f"too many missing features "
+                               f"({missing_count}/{len(feature_cols)})"))
                 continue
 
-            row = latest[avail_cols]
+            row = row[avail_cols]
             if row.isna().any(axis=1).iloc[0]:
                 row = row.fillna(0)
 
@@ -1124,9 +1210,15 @@ def predict_rankings(
     ranked = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
 
     logger.info(f"  Predictions: {len(ranked)} ok, {len(failures)} failed")
-    if failures and len(failures) <= 10:
-        for sym, reason in failures:
-            logger.info(f"    SKIP {sym}: {reason}")
+    if failures:
+        # Group failures by reason for summary
+        from collections import Counter
+        reason_counts = Counter(reason for _, reason in failures)
+        for reason, count in reason_counts.most_common(5):
+            logger.info(f"    Failure: {count}x — {reason}")
+        if len(failures) <= 10:
+            for sym, reason in failures:
+                logger.info(f"    SKIP {sym}: {reason}")
 
     # Prediction distribution stats
     if predictions:
