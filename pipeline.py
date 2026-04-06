@@ -1526,7 +1526,7 @@ def rebalance_portfolio(
             notional_usd=round(order["notional"], 2),
             predicted_return_pct=order.get("predicted_return"),
             rank=order.get("rank"),
-            target_weight_usd=round(target_weight, 2),
+            target_weight_usd=round(sym_allocations.get(sym, avg_weight), 2),
             entry_price=order.get("entry_price"),
             current_price=order.get("current_price"),
             unrealized_pnl_usd=order.get("unrealized_pnl_usd"),
