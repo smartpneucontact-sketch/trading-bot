@@ -42,6 +42,42 @@ import yfinance as yf
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# STACKED ENSEMBLE (needed for v6 model pickle deserialization)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class StackedEnsemble:
+    """Stacked ensemble: base models + ridge meta-learner."""
+
+    def __init__(self, base_models: list, meta_model, meta_scaler=None):
+        self.base_models = base_models
+        self.meta_model = meta_model
+        self.meta_scaler = meta_scaler
+
+    def predict(self, X):
+        base_preds = np.column_stack([
+            model.predict(X) for _, model in self.base_models
+        ])
+        if self.meta_scaler is not None:
+            base_preds = self.meta_scaler.transform(base_preds)
+        return self.meta_model.predict(base_preds)
+
+    @property
+    def feature_importances_(self):
+        coefs = np.abs(self.meta_model.coef_)
+        coefs = coefs / coefs.sum()
+        imp = np.zeros_like(self.base_models[0][1].feature_importances_, dtype=float)
+        for i, (name, model) in enumerate(self.base_models):
+            if hasattr(model, 'feature_importances_'):
+                imp += model.feature_importances_ * coefs[i]
+        return imp
+
+    @property
+    def meta_weights(self):
+        return {name: round(float(w), 4)
+                for (name, _), w in zip(self.base_models, self.meta_model.coef_)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
 
