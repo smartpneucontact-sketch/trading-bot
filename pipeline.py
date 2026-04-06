@@ -137,6 +137,7 @@ def get_active_models() -> list[ModelConfig]:
     Falls back to legacy ALPACA_API_KEY / ALPACA_SECRET_KEY for v4.
     """
     models = []
+    _log = logging.getLogger("pipeline")
 
     # v4 model
     v4_key = os.environ.get("MODEL_V4_ALPACA_KEY",
@@ -146,6 +147,10 @@ def get_active_models() -> list[ModelConfig]:
     v4_model_path = BASE_DIR / "model" / "v4" / "model.pkl"
     if not v4_model_path.exists():
         v4_model_path = BASE_DIR / "model" / "ml_v4_model.pkl"
+
+    _log.info(f"  v4: key={'YES' if v4_key else 'NO'}, "
+              f"secret={'YES' if v4_secret else 'NO'}, "
+              f"model={v4_model_path} exists={v4_model_path.exists()}")
 
     if v4_key and v4_secret and v4_model_path.exists():
         models.append(ModelConfig(
@@ -161,6 +166,10 @@ def get_active_models() -> list[ModelConfig]:
     v5_secret = os.environ.get("MODEL_V5_ALPACA_SECRET", "")
     v5_model_path = BASE_DIR / "model" / "v5" / "model.pkl"
 
+    _log.info(f"  v5: key={'YES' if v5_key else 'NO'}, "
+              f"secret={'YES' if v5_secret else 'NO'}, "
+              f"model={v5_model_path} exists={v5_model_path.exists()}")
+
     if v5_key and v5_secret and v5_model_path.exists():
         models.append(ModelConfig(
             name="v5",
@@ -174,6 +183,10 @@ def get_active_models() -> list[ModelConfig]:
     v6_key = os.environ.get("MODEL_V6_ALPACA_KEY", "")
     v6_secret = os.environ.get("MODEL_V6_ALPACA_SECRET", "")
     v6_model_path = BASE_DIR / "model" / "v6" / "model.pkl"
+
+    _log.info(f"  v6: key={'YES' if v6_key else 'NO'}, "
+              f"secret={'YES' if v6_secret else 'NO'}, "
+              f"model={v6_model_path} exists={v6_model_path.exists()}")
 
     if v6_key and v6_secret and v6_model_path.exists():
         models.append(ModelConfig(
