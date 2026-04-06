@@ -419,27 +419,72 @@ def setup_logging(model_name: str = "main"):
 # DATA DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _wiki_read_html(url: str, logger) -> list:
+    """Read HTML tables from Wikipedia with proper User-Agent."""
+    import requests as _req
+    import io
+    headers = {
+        "User-Agent": "MLTradingBot/1.0 (educational paper trading project)"
+    }
+    resp = _req.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return pd.read_html(io.StringIO(resp.text))
+
+
+# Symbol cache path — persists on Railway volume
+SYMBOL_CACHE_PATH = DATA_DIR / "universe_cache.json"
+
+
+def _load_symbol_cache(logger) -> list[str]:
+    """Load cached symbol list from last successful scrape."""
+    if SYMBOL_CACHE_PATH.exists():
+        try:
+            cache = json.loads(SYMBOL_CACHE_PATH.read_text())
+            syms = cache.get("symbols", [])
+            cached_at = cache.get("cached_at", "unknown")
+            logger.info(f"  Loaded {len(syms)} cached symbols (from {cached_at})")
+            return syms
+        except Exception as e:
+            logger.warning(f"  Cache load failed: {e}")
+    return []
+
+
+def _save_symbol_cache(symbols: list[str], logger):
+    """Save symbol list to cache for fallback."""
+    try:
+        SYMBOL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SYMBOL_CACHE_PATH.write_text(json.dumps({
+            "symbols": symbols,
+            "cached_at": datetime.now().isoformat(),
+            "count": len(symbols),
+        }, indent=2))
+        logger.info(f"  Saved {len(symbols)} symbols to cache")
+    except Exception as e:
+        logger.warning(f"  Cache save failed: {e}")
+
+
 def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
     """Get S&P 500 + Nasdaq 100 + Russell 1000 symbols from Wikipedia.
 
-    Expanded universe (~900-1000 unique stocks) for better alpha discovery,
-    especially in mid-caps where analyst coverage is thinner.
+    Uses proper User-Agent to avoid 403 blocks. Falls back to cached
+    symbol list if all scrapes fail.
     """
     report.start_step("get_universe")
     sp500, ndx_syms, russell_syms = [], [], []
 
     try:
-        sp500 = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        )[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        tables = _wiki_read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", logger
+        )
+        sp500 = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
         logger.info(f"  S&P 500: {len(sp500)} symbols from Wikipedia")
     except Exception as e:
         logger.warning(f"  S&P 500 scrape failed: {e}")
         report.add_warning(f"S&P 500 scrape failed: {e}")
 
     try:
-        ndx = pd.read_html(
-            "https://en.wikipedia.org/wiki/Nasdaq-100#Components"
+        ndx = _wiki_read_html(
+            "https://en.wikipedia.org/wiki/Nasdaq-100", logger
         )
         for table in ndx:
             if "Ticker" in table.columns:
@@ -455,8 +500,8 @@ def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
 
     # Russell 1000 — adds ~400-500 mid-cap stocks not in S&P 500
     try:
-        r1k_tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/Russell_1000_Index"
+        r1k_tables = _wiki_read_html(
+            "https://en.wikipedia.org/wiki/Russell_1000_Index", logger
         )
         for table in r1k_tables:
             if "Ticker" in table.columns:
@@ -471,6 +516,15 @@ def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
         report.add_warning(f"Russell 1000 scrape failed: {e}")
 
     all_syms = sorted(set(sp500 + ndx_syms + russell_syms) - EXCLUDED_SYMBOLS)
+
+    # If scraping failed completely, fall back to cache
+    if not all_syms:
+        logger.warning("  All scrapes failed — falling back to cached symbol list")
+        all_syms = _load_symbol_cache(logger)
+    else:
+        # Save successful scrape to cache
+        _save_symbol_cache(all_syms, logger)
+
     logger.info(f"  Total universe: {len(all_syms)} unique symbols "
                 f"(excluded {len(EXCLUDED_SYMBOLS)} blacklisted)")
     report.set("universe_size", len(all_syms))
