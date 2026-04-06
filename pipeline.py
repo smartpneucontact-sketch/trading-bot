@@ -137,7 +137,6 @@ def get_active_models() -> list[ModelConfig]:
     Falls back to legacy ALPACA_API_KEY / ALPACA_SECRET_KEY for v4.
     """
     models = []
-    _log = logging.getLogger("pipeline")
 
     # v4 model
     v4_key = os.environ.get("MODEL_V4_ALPACA_KEY",
@@ -148,9 +147,9 @@ def get_active_models() -> list[ModelConfig]:
     if not v4_model_path.exists():
         v4_model_path = BASE_DIR / "model" / "ml_v4_model.pkl"
 
-    _log.info(f"  v4: key={'YES' if v4_key else 'NO'}, "
-              f"secret={'YES' if v4_secret else 'NO'}, "
-              f"model={v4_model_path} exists={v4_model_path.exists()}")
+    print(f"[MODEL DETECT] v4: key={'YES' if v4_key else 'NO'}, "
+          f"secret={'YES' if v4_secret else 'NO'}, "
+          f"model={v4_model_path} exists={v4_model_path.exists()}", flush=True)
 
     if v4_key and v4_secret and v4_model_path.exists():
         models.append(ModelConfig(
@@ -166,9 +165,9 @@ def get_active_models() -> list[ModelConfig]:
     v5_secret = os.environ.get("MODEL_V5_ALPACA_SECRET", "")
     v5_model_path = BASE_DIR / "model" / "v5" / "model.pkl"
 
-    _log.info(f"  v5: key={'YES' if v5_key else 'NO'}, "
-              f"secret={'YES' if v5_secret else 'NO'}, "
-              f"model={v5_model_path} exists={v5_model_path.exists()}")
+    print(f"[MODEL DETECT] v5: key={'YES' if v5_key else 'NO'}, "
+          f"secret={'YES' if v5_secret else 'NO'}, "
+          f"model={v5_model_path} exists={v5_model_path.exists()}", flush=True)
 
     if v5_key and v5_secret and v5_model_path.exists():
         models.append(ModelConfig(
@@ -184,9 +183,9 @@ def get_active_models() -> list[ModelConfig]:
     v6_secret = os.environ.get("MODEL_V6_ALPACA_SECRET", "")
     v6_model_path = BASE_DIR / "model" / "v6" / "model.pkl"
 
-    _log.info(f"  v6: key={'YES' if v6_key else 'NO'}, "
-              f"secret={'YES' if v6_secret else 'NO'}, "
-              f"model={v6_model_path} exists={v6_model_path.exists()}")
+    print(f"[MODEL DETECT] v6: key={'YES' if v6_key else 'NO'}, "
+          f"secret={'YES' if v6_secret else 'NO'}, "
+          f"model={v6_model_path} exists={v6_model_path.exists()}", flush=True)
 
     if v6_key and v6_secret and v6_model_path.exists():
         models.append(ModelConfig(
@@ -197,6 +196,18 @@ def get_active_models() -> list[ModelConfig]:
             alpaca_secret=v6_secret,
         ))
 
+    # Also list model directory contents for debugging
+    model_dir = BASE_DIR / "model"
+    if model_dir.exists():
+        import subprocess
+        try:
+            result = subprocess.run(["find", str(model_dir), "-name", "*.pkl"],
+                                    capture_output=True, text=True, timeout=5)
+            print(f"[MODEL DETECT] .pkl files found: {result.stdout.strip()}", flush=True)
+        except Exception:
+            pass
+
+    print(f"[MODEL DETECT] Active: {[m.name for m in models]}", flush=True)
     return models
 
 
