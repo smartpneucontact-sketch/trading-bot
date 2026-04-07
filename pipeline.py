@@ -46,7 +46,7 @@ import yfinance as yf
 # ═══════════════════════════════════════════════════════════════════════════
 
 class StackedEnsemble:
-    """Stacked ensemble: base models + ridge meta-learner."""
+    """Stacked ensemble: base models + ridge meta-learner (v6)."""
 
     def __init__(self, base_models: list, meta_model, meta_scaler=None):
         self.base_models = base_models
@@ -60,6 +60,24 @@ class StackedEnsemble:
         if self.meta_scaler is not None:
             base_preds = self.meta_scaler.transform(base_preds)
         return self.meta_model.predict(base_preds)
+
+
+class EnsembleModel:
+    """Weighted ensemble of sub-models (v5).
+
+    Each entry in self.models is (name, model, weight).
+    Prediction = weighted average of sub-model predictions.
+    """
+
+    def __init__(self, models: list):
+        self.models = models
+
+    def predict(self, X):
+        total_weight = sum(w for _, _, w in self.models)
+        preds = np.zeros(len(X))
+        for name, model, weight in self.models:
+            preds += model.predict(X) * weight
+        return preds / total_weight
 
     @property
     def feature_importances_(self):
@@ -1077,7 +1095,8 @@ def conviction_weights(
 
 def _get_feature_func(feature_version: str):
     """Return the appropriate feature computation function for a model version."""
-    if feature_version == "v6":
+    if feature_version in ("v5", "v6"):
+        # v5 features are a subset of v6; extra features get ignored
         return compute_stock_features_v6
     else:
         return compute_stock_features
@@ -1682,10 +1701,14 @@ def run_single_model(
 
     # Custom unpickler to resolve classes saved from __main__ (e.g. train_ml_v6.py)
     class _PipelineUnpickler(pickle.Unpickler):
+        _class_map = {
+            "StackedEnsemble": StackedEnsemble,
+            "EnsembleModel": EnsembleModel,
+        }
+
         def find_class(self, module, name):
-            # Redirect __main__.StackedEnsemble to this module's class
-            if module == "__main__" and name == "StackedEnsemble":
-                return StackedEnsemble
+            if module == "__main__" and name in self._class_map:
+                return self._class_map[name]
             return super().find_class(module, name)
 
     model_bundle = _PipelineUnpickler(open(mc.model_path, "rb")).load()
