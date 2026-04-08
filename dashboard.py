@@ -25,6 +25,10 @@ import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
 from flask import Flask, jsonify, Response, request as flask_request
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -412,6 +416,219 @@ def api_portfolio_model(model_name):
     })
 
 
+# ── PERFORMANCE BENCHMARK ─────────────────────────────────────────────────
+
+# Cache for universe benchmark (expensive; recompute at most every 10 min)
+_perf_cache = {}
+_perf_cache_lock = threading.Lock()
+PERF_CACHE_TTL = 600  # 10 minutes
+
+
+def _get_universe_symbols() -> list[str]:
+    """Load universe symbols from the pipeline's cached symbol list."""
+    cache_path = DATA_DIR / "universe_cache.json"
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text())
+            return data.get("symbols", [])
+        except Exception:
+            pass
+    # Fallback: try to scrape S&P 500
+    try:
+        tables = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            attrs={"id": "constituents"},
+            storage_options={"User-Agent": "Mozilla/5.0"}
+        )
+        return tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+    except Exception:
+        return []
+
+
+def _compute_performance(model_name: str) -> dict:
+    """Compute model performance vs universe benchmark."""
+    logger = logging.getLogger("dashboard")
+
+    # Check cache
+    with _perf_cache_lock:
+        if model_name in _perf_cache:
+            cached_data, cached_at = _perf_cache[model_name]
+            if time.time() - cached_at < PERF_CACHE_TTL:
+                return cached_data
+
+    mc = _get_model_config(model_name)
+    if not mc:
+        return {"error": f"Model {model_name} not found"}
+
+    # 1) Get model positions from Alpaca
+    try:
+        positions = pipeline.alpaca_request("GET", "v2/positions", mc, logger=logger)
+    except Exception as e:
+        return {"error": f"Failed to fetch positions: {e}"}
+
+    if not positions:
+        return {"error": "No positions", "model": model_name}
+
+    # Parse positions
+    model_positions = []
+    for p in positions:
+        model_positions.append({
+            "symbol": p["symbol"],
+            "avg_entry_price": float(p.get("avg_entry_price", 0)),
+            "current_price": float(p.get("current_price", 0)),
+            "market_value": float(p.get("market_value", 0)),
+            "cost_basis": float(p.get("cost_basis", 0)),
+            "unrealized_plpc": float(p.get("unrealized_plpc", 0)) * 100,
+            "qty": float(p.get("qty", 0)),
+        })
+
+    # Calculate model return (weighted by position size)
+    total_value = sum(pos["market_value"] for pos in model_positions)
+    total_cost = sum(pos["cost_basis"] for pos in model_positions)
+    if total_cost > 0:
+        model_return_pct = (total_value / total_cost - 1) * 100
+    else:
+        model_return_pct = 0.0
+
+    model_avg_return = np.mean([pos["unrealized_plpc"] for pos in model_positions])
+
+    # 2) Determine entry date from positions
+    # Use Alpaca orders to find the most recent batch entry date
+    try:
+        orders = pipeline.alpaca_request(
+            "GET",
+            "v2/orders?status=filled&limit=200&direction=desc",
+            mc, logger=logger
+        )
+        # Find the earliest fill date among recent buy orders
+        fill_dates = []
+        for o in orders:
+            if o.get("side") == "buy" and o.get("filled_at"):
+                fill_dates.append(o["filled_at"][:10])  # YYYY-MM-DD
+        if fill_dates:
+            # Most orders fill on same day (rebalance); use the most common date
+            from collections import Counter
+            date_counts = Counter(fill_dates)
+            entry_date = date_counts.most_common(1)[0][0]
+        else:
+            entry_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+    except Exception:
+        entry_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+
+    # 3) Get universe symbols
+    universe_syms = _get_universe_symbols()
+    if not universe_syms:
+        return {
+            "model": model_name,
+            "model_return_pct": round(model_return_pct, 2),
+            "model_avg_stock_return": round(model_avg_return, 2),
+            "positions": model_positions,
+            "entry_date": entry_date,
+            "error": "Could not load universe symbols",
+        }
+
+    # 4) Download universe prices from entry_date to now
+    logger.info(f"[PERF] Computing benchmark for {model_name}: "
+                f"{len(universe_syms)} universe symbols from {entry_date}")
+
+    start_dt = pd.Timestamp(entry_date) - timedelta(days=3)
+    end_dt = pd.Timestamp.now() + timedelta(days=1)
+
+    universe_returns = []
+    batch_size = 100
+    for i in range(0, len(universe_syms), batch_size):
+        batch = universe_syms[i:i + batch_size]
+        try:
+            data = yf.download(
+                batch, start=start_dt, end=end_dt,
+                progress=False, threads=True
+            )
+            if data.empty:
+                continue
+
+            close = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+            if isinstance(close, pd.Series):
+                close = close.to_frame()
+
+            for sym in batch:
+                try:
+                    if sym in close.columns:
+                        series = close[sym].dropna()
+                    elif len(batch) == 1:
+                        series = close.iloc[:, 0].dropna()
+                    else:
+                        continue
+
+                    after_entry = series[series.index >= pd.Timestamp(entry_date)]
+                    if len(after_entry) < 2:
+                        continue
+
+                    entry_price = float(after_entry.iloc[0])
+                    current_price = float(after_entry.iloc[-1])
+                    if entry_price > 0:
+                        ret = (current_price / entry_price - 1) * 100
+                        universe_returns.append(ret)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"[PERF] Batch download error: {e}")
+
+    # 5) Compute SPY benchmark
+    spy_return = None
+    try:
+        spy_data = yf.download("SPY", start=start_dt, end=end_dt, progress=False)
+        if not spy_data.empty:
+            spy_close = spy_data["Close"]
+            if hasattr(spy_close, 'columns'):
+                spy_close = spy_close.iloc[:, 0]
+            after_entry = spy_close[spy_close.index >= pd.Timestamp(entry_date)]
+            if len(after_entry) >= 2:
+                spy_return = float((after_entry.iloc[-1] / after_entry.iloc[0] - 1) * 100)
+    except Exception:
+        pass
+
+    # 6) Build result
+    if universe_returns:
+        universe_avg = float(np.mean(universe_returns))
+        universe_median = float(np.median(universe_returns))
+        universe_std = float(np.std(universe_returns))
+        pct_positive = sum(1 for r in universe_returns if r > 0) / len(universe_returns) * 100
+    else:
+        universe_avg = universe_median = universe_std = pct_positive = 0.0
+
+    result = {
+        "model": model_name,
+        "entry_date": entry_date,
+        "n_positions": len(model_positions),
+        "model_return_pct": round(model_return_pct, 2),
+        "model_avg_stock_return": round(model_avg_return, 2),
+        "universe_n": len(universe_returns),
+        "universe_avg_return": round(universe_avg, 2),
+        "universe_median_return": round(universe_median, 2),
+        "universe_std": round(universe_std, 2),
+        "universe_pct_positive": round(pct_positive, 1),
+        "spy_return": round(spy_return, 2) if spy_return is not None else None,
+        "alpha_vs_universe": round(model_return_pct - universe_avg, 2),
+        "alpha_vs_spy": round(model_return_pct - spy_return, 2) if spy_return is not None else None,
+        "positions": sorted(model_positions, key=lambda x: x["unrealized_plpc"], reverse=True),
+    }
+
+    # Cache
+    with _perf_cache_lock:
+        _perf_cache[model_name] = (result, time.time())
+
+    return result
+
+
+@app.route("/api/performance/<model_name>")
+def api_performance(model_name):
+    """Performance comparison: model vs universe benchmark."""
+    result = _compute_performance(model_name)
+    if "error" in result and "model_return_pct" not in result:
+        return jsonify(result), 404 if "not found" in result.get("error", "") else 500
+    return jsonify(result)
+
+
 # ── LOG ENDPOINTS ─────────────────────────────────────────────────────────
 
 @app.route("/api/logs")
@@ -693,12 +910,14 @@ def index():
                     <button class="sub-tab active" onclick="switchSub('${{m}}','portfolio',this)">Portfolio</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','positions',this)">Positions</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','chart',this)">Equity Curve</button>
+                    <button class="sub-tab" onclick="switchSub('${{m}}','performance',this)">Performance</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','trades',this)">Trades</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','history',this)">Run History</button>
                 </div>
                 <div id="sub-portfolio-${{m}}" class="sub-content active"></div>
                 <div id="sub-positions-${{m}}" class="sub-content"></div>
                 <div id="sub-chart-${{m}}" class="sub-content"></div>
+                <div id="sub-performance-${{m}}" class="sub-content"></div>
                 <div id="sub-trades-${{m}}" class="sub-content"></div>
                 <div id="sub-history-${{m}}" class="sub-content"></div>
                 <div class="actions" style="margin-top:14px">
@@ -1046,6 +1265,126 @@ def index():
         $(`sub-history-${{model}}`).innerHTML = html;
     }}
 
+    async function loadPerformance(model) {{
+        const container = $(`sub-performance-${{model}}`);
+        container.innerHTML = '<div class="card"><h2>Performance vs Universe</h2><p style="color:var(--text-dim)"><span class="spinner"></span> Computing benchmark (may take 30-60s on first load)...</p></div>';
+
+        const data = await api(`/api/performance/${{model}}`);
+        let html = '<div class="card"><h2>Performance vs Universe Benchmark</h2>';
+
+        if (!data || data.error) {{
+            html += `<p style="color:var(--red)">${{data ? data.error : 'Failed to fetch performance data'}}</p>`;
+            html += '</div>';
+            container.innerHTML = html;
+            return;
+        }}
+
+        // Summary metrics
+        const alphaColor = data.alpha_vs_universe >= 0 ? 'green' : 'red';
+        const modelColor = data.model_return_pct >= 0 ? 'green' : 'red';
+        const univColor = data.universe_avg_return >= 0 ? 'green' : 'red';
+
+        html += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">
+            Entry date: <strong>${{data.entry_date}}</strong> &middot;
+            ${{data.n_positions}} positions &middot;
+            Universe: ${{data.universe_n}} stocks
+        </p>`;
+
+        html += '<div class="summary-row" style="margin-bottom:18px">';
+        html += `<div class="metric">
+            <div class="label">Model Return</div>
+            <div class="val ${{modelColor}}">${{fmtPct(data.model_return_pct)}}</div>
+            <div class="sub">Weighted portfolio return</div>
+        </div>`;
+        html += `<div class="metric">
+            <div class="label">Universe Avg</div>
+            <div class="val ${{univColor}}">${{fmtPct(data.universe_avg_return)}}</div>
+            <div class="sub">${{data.universe_n}} stocks, ${{data.universe_pct_positive?.toFixed(0) || '?'}}% positive</div>
+        </div>`;
+        html += `<div class="metric">
+            <div class="label">Alpha vs Universe</div>
+            <div class="val ${{alphaColor}}">${{fmtPct(data.alpha_vs_universe)}}</div>
+            <div class="sub">Model picks vs random stock</div>
+        </div>`;
+        if (data.spy_return != null) {{
+            const spyColor = data.spy_return >= 0 ? 'green' : 'red';
+            const alphaSpyColor = data.alpha_vs_spy >= 0 ? 'green' : 'red';
+            html += `<div class="metric">
+                <div class="label">SPY Return</div>
+                <div class="val ${{spyColor}}">${{fmtPct(data.spy_return)}}</div>
+                <div class="sub">Alpha vs SPY: <span class="${{alphaSpyColor}}">${{fmtPct(data.alpha_vs_spy)}}</span></div>
+            </div>`;
+        }}
+        html += '</div>';
+
+        // Comparison bar chart
+        html += '<div style="margin-bottom:18px">';
+        html += '<h3 style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Return Comparison</h3>';
+
+        const bars = [
+            {{ label: model.toUpperCase() + ' Portfolio', value: data.model_return_pct, color: '#3b82f6' }},
+            {{ label: 'Universe Average', value: data.universe_avg_return, color: '#6b7280' }},
+            {{ label: 'Universe Median', value: data.universe_median_return, color: '#4b5563' }},
+        ];
+        if (data.spy_return != null) {{
+            bars.push({{ label: 'SPY', value: data.spy_return, color: '#f59e0b' }});
+        }}
+
+        const maxAbs = Math.max(...bars.map(b => Math.abs(b.value)), 0.01);
+
+        bars.forEach(bar => {{
+            const pct = Math.abs(bar.value) / maxAbs * 100;
+            const isPos = bar.value >= 0;
+            html += `<div style="display:flex;align-items:center;margin-bottom:6px">
+                <div style="width:120px;font-size:12px;color:var(--text-dim);flex-shrink:0">${{bar.label}}</div>
+                <div style="flex:1;height:22px;position:relative;display:flex;align-items:center">
+                    <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--card-border)"></div>
+                    <div style="position:absolute;${{isPos ? 'left:50%' : 'right:50%'}};height:18px;width:${{pct/2}}%;
+                               background:${{bar.color}};border-radius:${{isPos ? '0 4px 4px 0' : '4px 0 0 4px'}};
+                               min-width:2px"></div>
+                </div>
+                <div style="width:70px;text-align:right;font-family:var(--mono);font-size:12px;flex-shrink:0"
+                     class="${{bar.value >= 0 ? 'green' : 'red'}}">${{fmtPct(bar.value)}}</div>
+            </div>`;
+        }});
+        html += '</div>';
+
+        // Universe stats
+        html += `<div style="margin-bottom:18px">
+            <h3 style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Universe Statistics</h3>
+            <table>
+                <tr><td>Average return</td><td class="text-right mono ${{cls(data.universe_avg_return)}}">${{fmtPct(data.universe_avg_return)}}</td></tr>
+                <tr><td>Median return</td><td class="text-right mono ${{cls(data.universe_median_return)}}">${{fmtPct(data.universe_median_return)}}</td></tr>
+                <tr><td>Std deviation</td><td class="text-right mono">${{data.universe_std?.toFixed(2) || '-'}}%</td></tr>
+                <tr><td>% positive</td><td class="text-right mono">${{data.universe_pct_positive?.toFixed(0) || '-'}}%</td></tr>
+                <tr><td>Stocks analyzed</td><td class="text-right mono">${{data.universe_n}}</td></tr>
+            </table>
+        </div>`;
+
+        // Position returns table
+        if (data.positions && data.positions.length > 0) {{
+            html += '<h3 style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Position Returns (sorted by P&L %)</h3>';
+            html += `<table>
+                <tr><th>#</th><th>Symbol</th><th class="text-right">Entry</th>
+                    <th class="text-right">Current</th><th class="text-right">Value</th>
+                    <th class="text-right">Return</th></tr>`;
+            data.positions.forEach((p, i) => {{
+                html += `<tr>
+                    <td>${{i+1}}</td>
+                    <td><strong>${{p.symbol}}</strong></td>
+                    <td class="text-right mono">${{fmt$(p.avg_entry_price)}}</td>
+                    <td class="text-right mono">${{fmt$(p.current_price)}}</td>
+                    <td class="text-right mono">${{fmt$(p.market_value)}}</td>
+                    <td class="text-right mono ${{cls(p.unrealized_plpc)}}">${{fmtPct(p.unrealized_plpc)}}</td>
+                </tr>`;
+            }});
+            html += '</table>';
+        }}
+
+        html += '</div>';
+        container.innerHTML = html;
+    }}
+
     async function loadLogsList() {{
         const logs = await api('/api/logs');
         if (logs && logs.length > 0) {{
@@ -1093,6 +1432,7 @@ def index():
                 if (sub === 'portfolio') await loadPortfolio(activeModel);
                 else if (sub === 'positions') await loadPositions(activeModel);
                 else if (sub === 'chart') await loadEquityCurve(activeModel);
+                else if (sub === 'performance') await loadPerformance(activeModel);
                 else if (sub === 'trades') await loadTrades(activeModel);
                 else if (sub === 'history') await loadRunHistory(activeModel);
             }}
