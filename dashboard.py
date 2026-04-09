@@ -227,6 +227,22 @@ def run_trading_pipeline(force=False, model_filter=None):
 app = Flask(__name__)
 
 
+@app.errorhandler(500)
+def handle_500(e):
+    import traceback
+    tb = traceback.format_exc()
+    logging.getLogger("dashboard").error(f"500 error: {e}\n{tb}")
+    return jsonify({"error": str(e), "traceback": tb}), 500
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    tb = traceback.format_exc()
+    logging.getLogger("dashboard").error(f"Unhandled exception: {e}\n{tb}")
+    return jsonify({"error": str(e), "traceback": tb}), 500
+
+
 def _get_log_files() -> list[Path]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     return sorted(LOG_DIR.glob("pipeline_*.log"), reverse=True)
@@ -812,7 +828,11 @@ def health():
 
 @app.route("/")
 def index():
-    active_models = pipeline.get_active_models()
+    try:
+        active_models = pipeline.get_active_models()
+    except Exception as e:
+        logging.getLogger("dashboard").error(f"get_active_models failed: {e}")
+        active_models = []
     model_names_json = json.dumps([mc.name for mc in active_models])
 
     with status_lock:
