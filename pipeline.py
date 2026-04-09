@@ -28,6 +28,7 @@ import logging
 import os
 import pickle
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field, asdict
@@ -142,10 +143,90 @@ class ModelConfig:
     alpaca_secret: str          # per-model Alpaca API secret
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
     state_path: Path = None     # auto-set if None
+    enable_cutloss: bool = False  # V7+: enable intraday cut-loss scanner
+    cutloss_hard_stop: float = -8.0    # hard stop: sell if down X% from entry
+    cutloss_trailing_stop: float = -5.0  # trailing stop: sell if down X% from peak
+    cutloss_portfolio_stop: float = -3.0  # portfolio drawdown: go to cash if daily loss > X%
 
     def __post_init__(self):
         if self.state_path is None:
             self.state_path = DATA_DIR / "state" / f"pipeline_state_{self.name}.json"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODEL DESCRIPTIONS — displayed on dashboard
+# ═══════════════════════════════════════════════════════════════════════════
+
+MODEL_DESCRIPTIONS = {
+    "v4": {
+        "title": "V4 — Single LightGBM Baseline",
+        "summary": "The original production model. A single LightGBM gradient-boosted "
+                   "tree trained to predict 5-day forward returns.",
+        "architecture": "Single LightGBM model (gradient boosting)",
+        "features": "84 features: 62 stock technical indicators (momentum, volatility, "
+                    "volume, moving averages, RSI, MACD, Bollinger Bands, etc.) + "
+                    "22 macro features (VIX, SPY/QQQ/IWM trends, sector ETFs, "
+                    "TLT/HYG credit spreads, gold, oil, dollar index)",
+        "portfolio": "Equal-weight top 20 stocks. Rebalance every 5 trading days.",
+        "risk": "No intraday monitoring. Market regime not considered. "
+                "Holds through volatility events.",
+        "training": "Trained on ~4 years of daily data across S&P 500 + Nasdaq 100 + "
+                    "Russell 1000 (~1000 stocks). Walk-forward validation.",
+    },
+    "v5": {
+        "title": "V5 — Weighted LightGBM Ensemble",
+        "summary": "Three LightGBM sub-models with different hyperparameters, combined "
+                   "via weighted average. Aims for more robust predictions than a single model.",
+        "architecture": "Weighted ensemble of 3 LightGBM models with optimized weights. "
+                        "Final prediction = weighted average of sub-model predictions.",
+        "features": "Same 84+46=130 features as V6 (62 stock technicals + 22 macro + "
+                    "46 cross-sectional rank features). Uses v6 feature function (superset).",
+        "portfolio": "Equal-weight top 20 stocks. Rebalance every 5 trading days.",
+        "risk": "No intraday monitoring. No market regime filter.",
+        "training": "Trained on ~4 years of daily data. Each sub-model uses different "
+                    "regularization (num_leaves, learning rate, min_child_samples) to "
+                    "promote diversity.",
+    },
+    "v6": {
+        "title": "V6 — Stacked Ensemble with Regime Filter",
+        "summary": "Five diverse base models (3x LightGBM variants, XGBoost, CatBoost) "
+                   "combined via Ridge regression meta-learner. Adds market regime "
+                   "awareness and conviction-weighted position sizing.",
+        "architecture": "Stacked ensemble: 5 base models (LightGBM main, LightGBM "
+                        "regularized, LightGBM DART, XGBoost, CatBoost) → Ridge "
+                        "meta-learner. Two-level prediction pipeline.",
+        "features": "130 features: 62 stock technicals + 22 macro + 46 cross-sectional "
+                    "rank features (cs_*). CS features rank each stock vs all peers at "
+                    "each time point — captures relative momentum, value, volume.",
+        "portfolio": "Conviction-weighted top 20: allocation proportional to prediction "
+                     "strength, capped at 2x equal weight. Higher-conviction picks get "
+                     "more capital.",
+        "risk": "Market regime filter (composite score from VIX level, SPY trend, "
+                "SPY momentum, HYG credit spread) → exposure multiplier 0.4–1.0. "
+                "Reduces position sizes in hostile regimes. No intraday monitoring.",
+        "training": "Trained on ~4 years of daily data. Base models trained independently, "
+                    "meta-learner trained on out-of-fold predictions to avoid overfitting.",
+    },
+    "v7": {
+        "title": "V7 — V6 Ensemble + Intraday Risk Management",
+        "summary": "Same stacked ensemble as V6, but adds real-time portfolio monitoring "
+                   "with automatic stop-loss execution. Scans positions every minute "
+                   "during market hours.",
+        "architecture": "Same as V6 (5 base models + Ridge meta-learner). Adds a "
+                        "real-time cut-loss scanner running every 60 seconds during "
+                        "market hours (9:30 AM – 4:00 PM ET).",
+        "features": "Same 130 features as V6. Identical prediction pipeline.",
+        "portfolio": "Conviction-weighted top 20 (same as V6). Positions actively "
+                     "monitored and can be liquidated intraday if stops are hit.",
+        "risk": "Three-layer risk management:\n"
+                "  1. Hard stop: auto-sell if position drops 8% from entry price\n"
+                "  2. Trailing stop: auto-sell if position drops 5% from its peak since entry\n"
+                "  3. Portfolio stop: liquidate ALL positions if daily portfolio loss exceeds 3%\n"
+                "Plus V6's market regime filter for position sizing.",
+        "training": "Uses same V6 model file — no retraining needed. Risk management "
+                    "is purely rule-based on live price data.",
+    },
+}
 
 
 def get_active_models() -> list[ModelConfig]:
@@ -212,6 +293,31 @@ def get_active_models() -> list[ModelConfig]:
             feature_version="v6",
             alpaca_key=v6_key,
             alpaca_secret=v6_secret,
+        ))
+
+    # v7 model — same model file as v6, but with cut-loss risk management
+    v7_key = os.environ.get("MODEL_V7_ALPACA_KEY", "")
+    v7_secret = os.environ.get("MODEL_V7_ALPACA_SECRET", "")
+    # V7 reuses the v6 model — no separate model file needed
+    v7_model_path = BASE_DIR / "model" / "v7" / "model.pkl"
+    if not v7_model_path.exists():
+        v7_model_path = BASE_DIR / "model" / "v6" / "model.pkl"  # fallback to v6
+
+    print(f"[MODEL DETECT] v7: key={'YES' if v7_key else 'NO'}, "
+          f"secret={'YES' if v7_secret else 'NO'}, "
+          f"model={v7_model_path} exists={v7_model_path.exists()}", flush=True)
+
+    if v7_key and v7_secret and v7_model_path.exists():
+        models.append(ModelConfig(
+            name="v7",
+            model_path=v7_model_path,
+            feature_version="v6",  # same features as v6
+            alpaca_key=v7_key,
+            alpaca_secret=v7_secret,
+            enable_cutloss=True,
+            cutloss_hard_stop=-8.0,
+            cutloss_trailing_stop=-5.0,
+            cutloss_portfolio_stop=-3.0,
         ))
 
     # Also list model directory contents for debugging
@@ -1845,6 +1951,210 @@ def run_single_model(
     summary = report.format_summary()
     logger.info(summary)
     logger.info(f"Log saved to: {log_file}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CUT-LOSS SCANNER — runs every minute during market hours for V7+
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Track peak prices per (model, symbol) for trailing stop
+_peak_prices: dict[tuple[str, str], float] = {}
+_peak_lock = threading.Lock()
+
+# Track daily portfolio start values for portfolio-level stop
+_daily_portfolio_start: dict[str, float] = {}
+
+
+def _is_market_open() -> bool:
+    """Check if US stock market is currently open (simple time check)."""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    # Market hours: 9:30 AM - 4:00 PM ET, Monday-Friday
+    if now.weekday() >= 5:  # Saturday/Sunday
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
+def cutloss_scan():
+    """Scan all cutloss-enabled models and execute stops if triggered.
+
+    Called every 60 seconds by the scheduler during market hours.
+    Three stop types:
+      1. Hard stop: sell if position is down X% from avg entry price
+      2. Trailing stop: sell if position is down X% from peak price since entry
+      3. Portfolio stop: liquidate ALL positions if daily portfolio drawdown > X%
+    """
+    if not _is_market_open():
+        return
+
+    logger = logging.getLogger("cutloss")
+
+    models = get_active_models()
+    cutloss_models = [mc for mc in models if mc.enable_cutloss]
+
+    if not cutloss_models:
+        return
+
+    for mc in cutloss_models:
+        try:
+            _cutloss_scan_model(mc, logger)
+        except Exception as e:
+            logger.error(f"[CUTLOSS] {mc.name}: scan error: {e}")
+
+
+def _cutloss_scan_model(mc: ModelConfig, logger):
+    """Run cut-loss checks for a single model."""
+    # Fetch positions
+    try:
+        positions = alpaca_request("GET", "v2/positions", mc, logger=logger)
+    except Exception as e:
+        logger.warning(f"[CUTLOSS] {mc.name}: failed to fetch positions: {e}")
+        return
+
+    if not positions:
+        return
+
+    # Fetch account for portfolio-level stop
+    try:
+        acct = alpaca_request("GET", "v2/account", mc, logger=logger)
+        current_equity = float(acct.get("equity", 0))
+        last_equity = float(acct.get("last_equity", 0))
+    except Exception:
+        current_equity = last_equity = 0
+
+    # Initialize daily start if needed (first scan of the day)
+    today = datetime.now().strftime("%Y-%m-%d")
+    daily_key = f"{mc.name}_{today}"
+    if daily_key not in _daily_portfolio_start and last_equity > 0:
+        _daily_portfolio_start[daily_key] = last_equity
+
+    start_equity = _daily_portfolio_start.get(daily_key, last_equity)
+
+    # ── Portfolio-level stop check ───────────────────────────
+    if start_equity > 0 and current_equity > 0:
+        daily_drawdown_pct = (current_equity / start_equity - 1) * 100
+        if daily_drawdown_pct <= mc.cutloss_portfolio_stop:
+            logger.warning(
+                f"[CUTLOSS] {mc.name}: PORTFOLIO STOP triggered! "
+                f"Daily drawdown: {daily_drawdown_pct:.2f}% <= {mc.cutloss_portfolio_stop}%. "
+                f"Liquidating ALL positions."
+            )
+            _liquidate_all(mc, positions, "portfolio_stop", logger)
+            return
+
+    # ── Per-position stop checks ─────────────────────────────
+    symbols_to_sell = []
+
+    for p in positions:
+        sym = p["symbol"]
+        qty = float(p.get("qty", 0))
+        avg_entry = float(p.get("avg_entry_price", 0))
+        current_price = float(p.get("current_price", 0))
+
+        if avg_entry <= 0 or current_price <= 0 or qty <= 0:
+            continue
+
+        # Update peak price for trailing stop
+        peak_key = (mc.name, sym)
+        with _peak_lock:
+            prev_peak = _peak_prices.get(peak_key, avg_entry)
+            current_peak = max(prev_peak, current_price)
+            _peak_prices[peak_key] = current_peak
+
+        # Hard stop: down X% from entry
+        pct_from_entry = (current_price / avg_entry - 1) * 100
+        if pct_from_entry <= mc.cutloss_hard_stop:
+            logger.warning(
+                f"[CUTLOSS] {mc.name}: HARD STOP on {sym}! "
+                f"{pct_from_entry:.2f}% from entry (threshold: {mc.cutloss_hard_stop}%)"
+            )
+            symbols_to_sell.append((sym, qty, "hard_stop", pct_from_entry))
+            continue
+
+        # Trailing stop: down X% from peak
+        pct_from_peak = (current_price / current_peak - 1) * 100
+        if pct_from_peak <= mc.cutloss_trailing_stop:
+            logger.warning(
+                f"[CUTLOSS] {mc.name}: TRAILING STOP on {sym}! "
+                f"{pct_from_peak:.2f}% from peak ${current_peak:.2f} "
+                f"(threshold: {mc.cutloss_trailing_stop}%)"
+            )
+            symbols_to_sell.append((sym, qty, "trailing_stop", pct_from_peak))
+            continue
+
+    # Execute sells
+    for sym, qty, reason, pct in symbols_to_sell:
+        try:
+            _execute_cutloss_sell(mc, sym, qty, reason, pct, logger)
+        except Exception as e:
+            logger.error(f"[CUTLOSS] {mc.name}: failed to sell {sym}: {e}")
+
+
+def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
+                          reason: str, pct: float, logger):
+    """Execute a market sell order for a cut-loss trigger."""
+    logger.info(f"[CUTLOSS] {mc.name}: SELLING {symbol} qty={qty:.2f} "
+                f"reason={reason} ({pct:.2f}%)")
+
+    order_data = {
+        "symbol": symbol,
+        "qty": str(qty),
+        "side": "sell",
+        "type": "market",
+        "time_in_force": "day",
+    }
+
+    try:
+        result = alpaca_request("POST", "v2/orders", mc, data=order_data, logger=logger)
+        order_id = result.get("id", "?")
+        logger.info(f"[CUTLOSS] {mc.name}: {symbol} sell order placed: {order_id}")
+
+        # Log to trade journal
+        journal = TradeJournal(mc.name)
+        record = TradeRecord(
+            trade_id=f"{mc.name}_cutloss_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{symbol}",
+            run_id=f"{mc.name}_cutloss_{datetime.now(timezone.utc).strftime('%Y%m%d')}",
+            model=mc.name,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            side="sell",
+            action=reason,
+            order_type="market",
+            notional_target=0,
+            order_status="submitted",
+            order_id=order_id,
+            shares=qty,
+        )
+        journal.log(record)
+
+        # Clear peak tracking for this symbol
+        peak_key = (mc.name, symbol)
+        _peak_prices.pop(peak_key, None)
+
+    except Exception as e:
+        logger.error(f"[CUTLOSS] {mc.name}: order failed for {symbol}: {e}")
+        raise
+
+
+def _liquidate_all(mc: ModelConfig, positions: list, reason: str, logger):
+    """Liquidate all positions for a model (portfolio-level stop)."""
+    logger.warning(f"[CUTLOSS] {mc.name}: LIQUIDATING ALL {len(positions)} positions ({reason})")
+
+    for p in positions:
+        sym = p["symbol"]
+        qty = float(p.get("qty", 0))
+        if qty > 0:
+            try:
+                _execute_cutloss_sell(mc, sym, qty, reason, 0.0, logger)
+            except Exception as e:
+                logger.error(f"[CUTLOSS] {mc.name}: failed to liquidate {sym}: {e}")
+
+    # Clear all peak tracking for this model
+    keys_to_remove = [k for k in _peak_prices if k[0] == mc.name]
+    for k in keys_to_remove:
+        _peak_prices.pop(k, None)
 
 
 def run_pipeline(dry_run: bool = False, force: bool = False,

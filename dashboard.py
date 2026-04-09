@@ -629,6 +629,30 @@ def api_performance(model_name):
     return jsonify(result)
 
 
+@app.route("/api/description/<model_name>")
+def api_description(model_name):
+    """Model description and architecture details."""
+    desc = pipeline.MODEL_DESCRIPTIONS.get(model_name)
+    if not desc:
+        return jsonify({"error": f"No description for model {model_name}"}), 404
+
+    mc = _get_model_config(model_name)
+    result = dict(desc)
+    result["name"] = model_name
+
+    # Add live config details
+    if mc:
+        result["enable_cutloss"] = mc.enable_cutloss
+        if mc.enable_cutloss:
+            result["cutloss_config"] = {
+                "hard_stop": f"{mc.cutloss_hard_stop}%",
+                "trailing_stop": f"{mc.cutloss_trailing_stop}%",
+                "portfolio_stop": f"{mc.cutloss_portfolio_stop}%",
+            }
+
+    return jsonify(result)
+
+
 # ── LOG ENDPOINTS ─────────────────────────────────────────────────────────
 
 @app.route("/api/logs")
@@ -913,6 +937,7 @@ def index():
                     <button class="sub-tab" onclick="switchSub('${{m}}','performance',this)">Performance</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','trades',this)">Trades</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','history',this)">Run History</button>
+                    <button class="sub-tab" onclick="switchSub('${{m}}','about',this)">About</button>
                 </div>
                 <div id="sub-portfolio-${{m}}" class="sub-content active"></div>
                 <div id="sub-positions-${{m}}" class="sub-content"></div>
@@ -920,6 +945,7 @@ def index():
                 <div id="sub-performance-${{m}}" class="sub-content"></div>
                 <div id="sub-trades-${{m}}" class="sub-content"></div>
                 <div id="sub-history-${{m}}" class="sub-content"></div>
+                <div id="sub-about-${{m}}" class="sub-content"></div>
                 <div class="actions" style="margin-top:14px">
                     <button class="btn btn-primary" onclick="triggerModelRun('${{m}}',false)">Run ${{m.toUpperCase()}}</button>
                     <button class="btn btn-secondary" onclick="triggerModelRun('${{m}}',true)">Dry Run</button>
@@ -1265,6 +1291,66 @@ def index():
         $(`sub-history-${{model}}`).innerHTML = html;
     }}
 
+    async function loadAbout(model) {{
+        const data = await api(`/api/description/${{model}}`);
+        let html = '<div class="card">';
+
+        if (!data || data.error) {{
+            html += `<h2>About ${{model.toUpperCase()}}</h2>`;
+            html += `<p style="color:var(--text-dim)">No description available</p>`;
+            html += '</div>';
+            $(`sub-about-${{model}}`).innerHTML = html;
+            return;
+        }}
+
+        html += `<h2 style="color:var(--text-bright);font-size:16px;margin-bottom:4px;text-transform:none;letter-spacing:0">${{data.title || model.toUpperCase()}}</h2>`;
+        html += `<p style="color:var(--text);margin-bottom:18px;font-size:13px;line-height:1.6">${{data.summary}}</p>`;
+
+        const sections = [
+            {{ icon: '\u2699\ufe0f', label: 'Architecture', key: 'architecture' }},
+            {{ icon: '\ud83d\udcca', label: 'Features', key: 'features' }},
+            {{ icon: '\ud83d\udcbc', label: 'Portfolio Strategy', key: 'portfolio' }},
+            {{ icon: '\ud83d\udee1\ufe0f', label: 'Risk Management', key: 'risk' }},
+            {{ icon: '\ud83c\udfaf', label: 'Training', key: 'training' }},
+        ];
+
+        sections.forEach(sec => {{
+            if (data[sec.key]) {{
+                html += `<div style="margin-bottom:14px">
+                    <div style="color:var(--text-dim);font-size:11px;text-transform:uppercase;
+                                letter-spacing:1px;margin-bottom:6px;font-weight:600">
+                        ${{sec.icon}} ${{sec.label}}
+                    </div>
+                    <p style="color:var(--text);font-size:13px;line-height:1.6;
+                              white-space:pre-line">${{data[sec.key]}}</p>
+                </div>`;
+            }}
+        }});
+
+        if (data.enable_cutloss && data.cutloss_config) {{
+            html += `<div style="margin-top:14px;padding:14px;background:#1a1c24;border-radius:8px;
+                                border:1px solid var(--yellow)30">
+                <div style="color:var(--yellow);font-size:12px;font-weight:600;margin-bottom:8px">
+                    \u26a0\ufe0f ACTIVE CUT-LOSS PROTECTION
+                </div>
+                <table style="font-size:12px">
+                    <tr><td style="padding:3px 10px 3px 0">Hard stop (from entry)</td>
+                        <td class="mono red">${{data.cutloss_config.hard_stop}}</td></tr>
+                    <tr><td style="padding:3px 10px 3px 0">Trailing stop (from peak)</td>
+                        <td class="mono red">${{data.cutloss_config.trailing_stop}}</td></tr>
+                    <tr><td style="padding:3px 10px 3px 0">Portfolio drawdown stop</td>
+                        <td class="mono red">${{data.cutloss_config.portfolio_stop}}</td></tr>
+                </table>
+                <p style="color:var(--text-dim);font-size:11px;margin-top:8px">
+                    Scanner runs every 60 seconds during market hours (9:30 AM - 4:00 PM ET)
+                </p>
+            </div>`;
+        }}
+
+        html += '</div>';
+        $(`sub-about-${{model}}`).innerHTML = html;
+    }}
+
     async function loadPerformance(model) {{
         const container = $(`sub-performance-${{model}}`);
         container.innerHTML = '<div class="card"><h2>Performance vs Universe</h2><p style="color:var(--text-dim)"><span class="spinner"></span> Computing benchmark (may take 30-60s on first load)...</p></div>';
@@ -1435,6 +1521,7 @@ def index():
                 else if (sub === 'performance') await loadPerformance(activeModel);
                 else if (sub === 'trades') await loadTrades(activeModel);
                 else if (sub === 'history') await loadRunHistory(activeModel);
+                else if (sub === 'about') await loadAbout(activeModel);
             }}
         }} catch(e) {{
             console.error('Refresh error:', e);
@@ -1480,6 +1567,18 @@ if __name__ == "__main__":
         id="trading_pipeline",
         name="Daily ML Trading Pipeline",
     )
+    # Cut-loss scanner: runs every 60 seconds during market hours for V7+
+    cutloss_models = [mc for mc in pipeline.get_active_models() if mc.enable_cutloss]
+    if cutloss_models:
+        scheduler.add_job(
+            pipeline.cutloss_scan,
+            'interval',
+            seconds=60,
+            id="cutloss_scanner",
+            name="Cut-Loss Scanner (V7+)",
+        )
+        logger.info(f"Cut-loss scanner enabled for: {[mc.name for mc in cutloss_models]}")
+
     scheduler.start()
 
     next_run = scheduler.get_job("trading_pipeline").next_run_time
