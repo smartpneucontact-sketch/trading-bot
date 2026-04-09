@@ -543,18 +543,29 @@ def _compute_performance(model_name: str) -> dict:
                 batch, start=start_dt, end=end_dt,
                 progress=False, threads=True
             )
-            if data.empty:
+            if data is None or data.empty:
                 continue
 
-            close = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+            # Handle both MultiIndex and flat column formats from yfinance
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    close = data["Close"]
+                elif "Close" in data.columns:
+                    close = data[["Close"]]
+                    close.columns = batch[:1] if len(batch) == 1 else close.columns
+                else:
+                    continue
+            except (KeyError, TypeError):
+                continue
+
             if isinstance(close, pd.Series):
-                close = close.to_frame()
+                close = close.to_frame(name=batch[0] if len(batch) == 1 else "Close")
 
             for sym in batch:
                 try:
                     if sym in close.columns:
                         series = close[sym].dropna()
-                    elif len(batch) == 1:
+                    elif len(batch) == 1 and len(close.columns) == 1:
                         series = close.iloc[:, 0].dropna()
                     else:
                         continue
@@ -577,15 +588,19 @@ def _compute_performance(model_name: str) -> dict:
     spy_return = None
     try:
         spy_data = yf.download("SPY", start=start_dt, end=end_dt, progress=False)
-        if not spy_data.empty:
-            spy_close = spy_data["Close"]
-            if hasattr(spy_close, 'columns'):
+        if spy_data is not None and not spy_data.empty:
+            if isinstance(spy_data.columns, pd.MultiIndex):
+                spy_close = spy_data["Close"].iloc[:, 0] if isinstance(spy_data["Close"], pd.DataFrame) else spy_data["Close"]
+            else:
+                spy_close = spy_data["Close"]
+            if isinstance(spy_close, pd.DataFrame):
                 spy_close = spy_close.iloc[:, 0]
+            spy_close = spy_close.dropna()
             after_entry = spy_close[spy_close.index >= pd.Timestamp(entry_date)]
             if len(after_entry) >= 2:
                 spy_return = float((after_entry.iloc[-1] / after_entry.iloc[0] - 1) * 100)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[PERF] SPY download failed: {e}")
 
     # 6) Build result
     if universe_returns:
@@ -623,34 +638,44 @@ def _compute_performance(model_name: str) -> dict:
 @app.route("/api/performance/<model_name>")
 def api_performance(model_name):
     """Performance comparison: model vs universe benchmark."""
-    result = _compute_performance(model_name)
-    if "error" in result and "model_return_pct" not in result:
-        return jsonify(result), 404 if "not found" in result.get("error", "") else 500
-    return jsonify(result)
+    try:
+        result = _compute_performance(model_name)
+        if "error" in result and "model_return_pct" not in result:
+            return jsonify(result), 404 if "not found" in result.get("error", "") else 500
+        return jsonify(result)
+    except Exception as e:
+        logging.getLogger("dashboard").error(f"Performance API error for {model_name}: {e}")
+        return jsonify({"error": f"Internal error: {str(e)}", "model": model_name}), 500
 
 
 @app.route("/api/description/<model_name>")
 def api_description(model_name):
     """Model description and architecture details."""
-    desc = pipeline.MODEL_DESCRIPTIONS.get(model_name)
-    if not desc:
-        return jsonify({"error": f"No description for model {model_name}"}), 404
+    try:
+        desc = pipeline.MODEL_DESCRIPTIONS.get(model_name)
+        if not desc:
+            return jsonify({"error": f"No description for model {model_name}"}), 404
 
-    mc = _get_model_config(model_name)
-    result = dict(desc)
-    result["name"] = model_name
+        mc = _get_model_config(model_name)
+        result = dict(desc)
+        result["name"] = model_name
 
-    # Add live config details
-    if mc:
-        result["enable_cutloss"] = mc.enable_cutloss
-        if mc.enable_cutloss:
-            result["cutloss_config"] = {
-                "hard_stop": f"{mc.cutloss_hard_stop}%",
-                "trailing_stop": f"{mc.cutloss_trailing_stop}%",
-                "portfolio_stop": f"{mc.cutloss_portfolio_stop}%",
-            }
+        # Add live config details
+        if mc:
+            result["enable_cutloss"] = mc.enable_cutloss
+            if mc.enable_cutloss:
+                result["cutloss_config"] = {
+                    "hard_stop": f"{mc.cutloss_hard_stop}%",
+                    "trailing_stop": f"{mc.cutloss_trailing_stop}%",
+                    "portfolio_stop": f"{mc.cutloss_portfolio_stop}%",
+                }
+        else:
+            result["enable_cutloss"] = False
 
-    return jsonify(result)
+        return jsonify(result)
+    except Exception as e:
+        logging.getLogger("dashboard").error(f"Description API error for {model_name}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # ── LOG ENDPOINTS ─────────────────────────────────────────────────────────
