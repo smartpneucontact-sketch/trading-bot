@@ -1437,11 +1437,11 @@ def index():
         html += `<p style="color:var(--text);margin-bottom:18px;font-size:13px;line-height:1.6">${{data.summary}}</p>`;
 
         const sections = [
-            {{ icon: '\u2699\ufe0f', label: 'Architecture', key: 'architecture' }},
-            {{ icon: '\ud83d\udcca', label: 'Features', key: 'features' }},
-            {{ icon: '\ud83d\udcbc', label: 'Portfolio Strategy', key: 'portfolio' }},
-            {{ icon: '\ud83d\udee1\ufe0f', label: 'Risk Management', key: 'risk' }},
-            {{ icon: '\ud83c\udfaf', label: 'Training', key: 'training' }},
+            {{ icon: '&#9881;', label: 'Architecture', key: 'architecture' }},
+            {{ icon: '&#128202;', label: 'Features', key: 'features' }},
+            {{ icon: '&#128188;', label: 'Portfolio Strategy', key: 'portfolio' }},
+            {{ icon: '&#128737;', label: 'Risk Management', key: 'risk' }},
+            {{ icon: '&#127919;', label: 'Training', key: 'training' }},
         ];
 
         sections.forEach(sec => {{
@@ -1461,7 +1461,7 @@ def index():
             html += `<div style="margin-top:14px;padding:14px;background:#1a1c24;border-radius:8px;
                                 border:1px solid var(--yellow)30">
                 <div style="color:var(--yellow);font-size:12px;font-weight:600;margin-bottom:8px">
-                    \u26a0\ufe0f ACTIVE CUT-LOSS PROTECTION
+                    &#9888; ACTIVE CUT-LOSS PROTECTION
                 </div>
                 <table style="font-size:12px">
                     <tr><td style="padding:3px 10px 3px 0">Hard stop (from entry)</td>
