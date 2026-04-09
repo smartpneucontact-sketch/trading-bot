@@ -229,98 +229,179 @@ MODEL_DESCRIPTIONS = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# DYNAMIC MODEL CONFIGURATION (dashboard-managed)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# All known models and their static properties
+MODEL_REGISTRY = {
+    "v4": {"feature_version": "v4", "model_dir": "v4", "fallback_model": "ml_v4_model.pkl"},
+    "v5": {"feature_version": "v5", "model_dir": "v5", "fallback_model": None},
+    "v6": {"feature_version": "v6", "model_dir": "v6", "fallback_model": None},
+    "v7": {"feature_version": "v6", "model_dir": "v6", "fallback_model": None},  # reuses v6 model
+}
+
+CONFIG_PATH = DATA_DIR / "model_config.json"
+
+
+def _default_config() -> dict:
+    """Generate default config with 3 slots."""
+    return {
+        "slots": [
+            {
+                "slot_id": 1,
+                "model": "v4",
+                "enabled": True,
+                "alpaca_key": "",
+                "alpaca_secret": "",
+                "enable_cutloss": False,
+                "cutloss_hard_stop": -8.0,
+                "cutloss_trailing_stop": -5.0,
+                "cutloss_portfolio_stop": -3.0,
+            },
+            {
+                "slot_id": 2,
+                "model": "v5",
+                "enabled": True,
+                "alpaca_key": "",
+                "alpaca_secret": "",
+                "enable_cutloss": False,
+                "cutloss_hard_stop": -8.0,
+                "cutloss_trailing_stop": -5.0,
+                "cutloss_portfolio_stop": -3.0,
+            },
+            {
+                "slot_id": 3,
+                "model": "v6",
+                "enabled": True,
+                "alpaca_key": "",
+                "alpaca_secret": "",
+                "enable_cutloss": False,
+                "cutloss_hard_stop": -8.0,
+                "cutloss_trailing_stop": -5.0,
+                "cutloss_portfolio_stop": -3.0,
+            },
+        ],
+        "updated_at": None,
+    }
+
+
+def load_model_config() -> dict:
+    """Load model config from persistent storage."""
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            pass
+    return _default_config()
+
+
+def save_model_config(config: dict):
+    """Save model config to persistent storage."""
+    config["updated_at"] = datetime.now().isoformat()
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+
+
+def _resolve_model_path(model_name: str) -> Path:
+    """Find model.pkl for a given model name."""
+    reg = MODEL_REGISTRY.get(model_name, {})
+    model_dir = reg.get("model_dir", model_name)
+
+    # Primary: model/<dir>/model.pkl
+    path = BASE_DIR / "model" / model_dir / "model.pkl"
+    if path.exists():
+        return path
+
+    # Fallback (e.g. ml_v4_model.pkl)
+    fallback = reg.get("fallback_model")
+    if fallback:
+        alt = BASE_DIR / "model" / fallback
+        if alt.exists():
+            return alt
+
+    return path  # return primary even if missing (caller checks .exists())
+
+
 def get_active_models() -> list[ModelConfig]:
-    """Discover active models from environment variables.
+    """Build active models from config file + env var fallback.
 
-    Looks for MODEL_{NAME}_ALPACA_KEY / MODEL_{NAME}_ALPACA_SECRET pairs.
-    Falls back to legacy ALPACA_API_KEY / ALPACA_SECRET_KEY for v4.
+    Priority: config file slots > env vars.
+    Only slots with valid API keys and existing model files are activated.
     """
+    config = load_model_config()
     models = []
+    config_has_keys = False
 
-    # v4 model
-    v4_key = os.environ.get("MODEL_V4_ALPACA_KEY",
-                            os.environ.get("ALPACA_API_KEY", ""))
-    v4_secret = os.environ.get("MODEL_V4_ALPACA_SECRET",
-                               os.environ.get("ALPACA_SECRET_KEY", ""))
-    v4_model_path = BASE_DIR / "model" / "v4" / "model.pkl"
-    if not v4_model_path.exists():
-        v4_model_path = BASE_DIR / "model" / "ml_v4_model.pkl"
+    # -- Try config file first --
+    for slot in config.get("slots", []):
+        if not slot.get("enabled", True):
+            continue
 
-    print(f"[MODEL DETECT] v4: key={'YES' if v4_key else 'NO'}, "
-          f"secret={'YES' if v4_secret else 'NO'}, "
-          f"model={v4_model_path} exists={v4_model_path.exists()}", flush=True)
+        model_name = slot.get("model", "")
+        if model_name not in MODEL_REGISTRY:
+            continue
 
-    if v4_key and v4_secret and v4_model_path.exists():
-        models.append(ModelConfig(
-            name="v4",
-            model_path=v4_model_path,
-            feature_version="v4",
-            alpaca_key=v4_key,
-            alpaca_secret=v4_secret,
-        ))
+        key = slot.get("alpaca_key", "")
+        secret = slot.get("alpaca_secret", "")
 
-    # v5 model
-    v5_key = os.environ.get("MODEL_V5_ALPACA_KEY", "")
-    v5_secret = os.environ.get("MODEL_V5_ALPACA_SECRET", "")
-    v5_model_path = BASE_DIR / "model" / "v5" / "model.pkl"
+        if key and secret:
+            config_has_keys = True
 
-    print(f"[MODEL DETECT] v5: key={'YES' if v5_key else 'NO'}, "
-          f"secret={'YES' if v5_secret else 'NO'}, "
-          f"model={v5_model_path} exists={v5_model_path.exists()}", flush=True)
+        model_path = _resolve_model_path(model_name)
+        reg = MODEL_REGISTRY[model_name]
 
-    if v5_key and v5_secret and v5_model_path.exists():
-        models.append(ModelConfig(
-            name="v5",
-            model_path=v5_model_path,
-            feature_version="v5",
-            alpaca_key=v5_key,
-            alpaca_secret=v5_secret,
-        ))
+        print(f"[MODEL DETECT] slot {slot.get('slot_id')}: model={model_name}, "
+              f"key={'YES' if key else 'NO'}, secret={'YES' if secret else 'NO'}, "
+              f"model_file={model_path} exists={model_path.exists()}", flush=True)
 
-    # v6 model
-    v6_key = os.environ.get("MODEL_V6_ALPACA_KEY", "")
-    v6_secret = os.environ.get("MODEL_V6_ALPACA_SECRET", "")
-    v6_model_path = BASE_DIR / "model" / "v6" / "model.pkl"
+        if key and secret and model_path.exists():
+            models.append(ModelConfig(
+                name=model_name,
+                model_path=model_path,
+                feature_version=reg["feature_version"],
+                alpaca_key=key,
+                alpaca_secret=secret,
+                enable_cutloss=slot.get("enable_cutloss", False),
+                cutloss_hard_stop=slot.get("cutloss_hard_stop", -8.0),
+                cutloss_trailing_stop=slot.get("cutloss_trailing_stop", -5.0),
+                cutloss_portfolio_stop=slot.get("cutloss_portfolio_stop", -3.0),
+            ))
 
-    print(f"[MODEL DETECT] v6: key={'YES' if v6_key else 'NO'}, "
-          f"secret={'YES' if v6_secret else 'NO'}, "
-          f"model={v6_model_path} exists={v6_model_path.exists()}", flush=True)
+    # -- Fallback to env vars if config has no keys --
+    if not config_has_keys:
+        print("[MODEL DETECT] No keys in config file, falling back to env vars", flush=True)
+        env_models = [
+            ("v4", "MODEL_V4_ALPACA_KEY", "MODEL_V4_ALPACA_SECRET",
+             "ALPACA_API_KEY", "ALPACA_SECRET_KEY"),
+            ("v5", "MODEL_V5_ALPACA_KEY", "MODEL_V5_ALPACA_SECRET", None, None),
+            ("v6", "MODEL_V6_ALPACA_KEY", "MODEL_V6_ALPACA_SECRET", None, None),
+        ]
+        for name, key_env, secret_env, fallback_key, fallback_secret in env_models:
+            key = os.environ.get(key_env, "")
+            secret = os.environ.get(secret_env, "")
+            if not key and fallback_key:
+                key = os.environ.get(fallback_key, "")
+            if not secret and fallback_secret:
+                secret = os.environ.get(fallback_secret, "")
 
-    if v6_key and v6_secret and v6_model_path.exists():
-        models.append(ModelConfig(
-            name="v6",
-            model_path=v6_model_path,
-            feature_version="v6",
-            alpaca_key=v6_key,
-            alpaca_secret=v6_secret,
-        ))
+            model_path = _resolve_model_path(name)
+            reg = MODEL_REGISTRY[name]
 
-    # v7 model — same model file as v6, but with cut-loss risk management
-    v7_key = os.environ.get("MODEL_V7_ALPACA_KEY", "")
-    v7_secret = os.environ.get("MODEL_V7_ALPACA_SECRET", "")
-    # V7 reuses the v6 model — no separate model file needed
-    v7_model_path = BASE_DIR / "model" / "v7" / "model.pkl"
-    if not v7_model_path.exists():
-        v7_model_path = BASE_DIR / "model" / "v6" / "model.pkl"  # fallback to v6
+            print(f"[MODEL DETECT] env {name}: key={'YES' if key else 'NO'}, "
+                  f"secret={'YES' if secret else 'NO'}, "
+                  f"model={model_path} exists={model_path.exists()}", flush=True)
 
-    print(f"[MODEL DETECT] v7: key={'YES' if v7_key else 'NO'}, "
-          f"secret={'YES' if v7_secret else 'NO'}, "
-          f"model={v7_model_path} exists={v7_model_path.exists()}", flush=True)
+            if key and secret and model_path.exists():
+                models.append(ModelConfig(
+                    name=name,
+                    model_path=model_path,
+                    feature_version=reg["feature_version"],
+                    alpaca_key=key,
+                    alpaca_secret=secret,
+                ))
 
-    if v7_key and v7_secret and v7_model_path.exists():
-        models.append(ModelConfig(
-            name="v7",
-            model_path=v7_model_path,
-            feature_version="v6",  # same features as v6
-            alpaca_key=v7_key,
-            alpaca_secret=v7_secret,
-            enable_cutloss=True,
-            cutloss_hard_stop=-8.0,
-            cutloss_trailing_stop=-5.0,
-            cutloss_portfolio_stop=-3.0,
-        ))
-
-    # Also list model directory contents for debugging
+    # Debug: list model files
     model_dir = BASE_DIR / "model"
     if model_dir.exists():
         import subprocess
@@ -333,6 +414,33 @@ def get_active_models() -> list[ModelConfig]:
 
     print(f"[MODEL DETECT] Active: {[m.name for m in models]}", flush=True)
     return models
+
+
+def test_alpaca_key(key: str, secret: str,
+                    base_url: str = "https://paper-api.alpaca.markets") -> dict:
+    """Test an Alpaca API key pair. Returns account info or error."""
+    import requests
+    try:
+        headers = {
+            "APCA-API-KEY-ID": key,
+            "APCA-API-SECRET-KEY": secret,
+        }
+        resp = requests.get(f"{base_url}/v2/account", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            acct = resp.json()
+            return {
+                "ok": True,
+                "status": acct.get("status", "unknown"),
+                "equity": float(acct.get("equity", 0)),
+                "cash": float(acct.get("cash", 0)),
+                "buying_power": float(acct.get("buying_power", 0)),
+                "currency": acct.get("currency", "USD"),
+                "account_number": acct.get("account_number", "?"),
+            }
+        else:
+            return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -678,6 +678,73 @@ def api_description(model_name):
         return jsonify({"error": str(e)}), 500
 
 
+# ── CONFIG ENDPOINTS (model slot management) ─────────────────────────────
+
+@app.route("/api/config/models")
+def api_config_models():
+    """Get current model slot configuration."""
+    config = pipeline.load_model_config()
+    # Enrich with model info
+    for slot in config.get("slots", []):
+        model_name = slot.get("model", "")
+        slot["model_file_exists"] = pipeline._resolve_model_path(model_name).exists()
+        slot["description"] = pipeline.MODEL_DESCRIPTIONS.get(model_name, {}).get("title", model_name)
+    config["available_models"] = list(pipeline.MODEL_REGISTRY.keys())
+    config["active_models"] = [mc.name for mc in pipeline.get_active_models()]
+    return jsonify(config)
+
+
+@app.route("/api/config/models", methods=["POST"])
+def api_config_update():
+    """Update model slot configuration."""
+    try:
+        data = flask_request.get_json()
+        if not data or "slots" not in data:
+            return jsonify({"error": "Missing 'slots' in request body"}), 400
+
+        config = pipeline.load_model_config()
+        new_slots = data["slots"]
+
+        # Validate
+        if len(new_slots) > 3:
+            return jsonify({"error": "Maximum 3 slots allowed"}), 400
+
+        for slot in new_slots:
+            model = slot.get("model", "")
+            if model and model not in pipeline.MODEL_REGISTRY:
+                return jsonify({"error": f"Unknown model: {model}"}), 400
+
+        config["slots"] = new_slots
+        pipeline.save_model_config(config)
+
+        # Re-initialize model status in dashboard
+        _initialize_model_status()
+
+        # Clear API caches since models may have changed
+        with _cache_lock:
+            _api_cache.clear()
+
+        return jsonify({"ok": True, "config": config})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/config/test-key", methods=["POST"])
+def api_config_test_key():
+    """Test an Alpaca API key pair."""
+    try:
+        data = flask_request.get_json()
+        key = data.get("key", "")
+        secret = data.get("secret", "")
+        if not key or not secret:
+            return jsonify({"ok": False, "error": "Both key and secret are required"}), 400
+
+        result = pipeline.test_alpaca_key(key, secret)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ── LOG ENDPOINTS ─────────────────────────────────────────────────────────
 
 @app.route("/api/logs")
@@ -918,6 +985,24 @@ def index():
     <div id="error-card" class="card" style="display:none;border-color:var(--red);margin-top:16px">
         <h2 style="color:var(--red)">Last Error</h2>
         <div id="error-content" class="log-box" style="color:var(--red)"></div>
+    </div>
+
+    <!-- Settings section (collapsible) -->
+    <div class="card" id="settings-section">
+        <h2 style="cursor:pointer" onclick="toggleSettings()">
+            Settings <span id="settings-toggle" style="font-size:10px">&#9660;</span>
+        </h2>
+        <div id="settings-content" style="display:none">
+            <p style="color:var(--text-dim);font-size:12px;margin-bottom:14px">
+                3 trading slots available. Assign a model and Alpaca API keys to each slot.
+                Changes take effect on the next pipeline run.
+            </p>
+            <div id="slots-container"></div>
+            <div style="margin-top:14px;display:flex;gap:8px">
+                <button class="btn btn-primary" onclick="saveConfig()">Save Configuration</button>
+                <span id="save-status" style="font-size:12px;color:var(--text-dim);align-self:center"></span>
+            </div>
+        </div>
     </div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -1554,6 +1639,198 @@ def index():
 
         bar.style.width = '100%';
         setTimeout(() => bar.style.width = '0%', 300);
+    }}
+
+    // ── Settings ────────────────────────────────────────
+    let settingsOpen = false;
+    let currentConfig = null;
+
+    function toggleSettings() {{
+        settingsOpen = !settingsOpen;
+        $('settings-content').style.display = settingsOpen ? 'block' : 'none';
+        $('settings-toggle').innerHTML = settingsOpen ? '&#9650;' : '&#9660;';
+        if (settingsOpen && !currentConfig) loadSettings();
+    }}
+
+    async function loadSettings() {{
+        const data = await api('/api/config/models');
+        if (!data) return;
+        currentConfig = data;
+        renderSlots(data);
+    }}
+
+    function renderSlots(config) {{
+        const available = config.available_models || ['v4','v5','v6','v7'];
+        const slots = config.slots || [];
+        let html = '';
+
+        for (let i = 0; i < 3; i++) {{
+            const slot = slots[i] || {{ slot_id: i+1, model: '', enabled: true, alpaca_key: '', alpaca_secret: '' }};
+            const enabled = slot.enabled !== false;
+            const hasKey = slot.alpaca_key && slot.alpaca_key.length > 0;
+            const modelExists = slot.model_file_exists !== false;
+
+            html += `<div class="card" style="margin-bottom:12px;border-color:${{enabled && hasKey ? 'var(--green)' : 'var(--card-border)'}}">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                    <div style="display:flex;align-items:center;gap:10px">
+                        <strong style="color:var(--text-bright);font-size:14px">Slot ${{i+1}}</strong>
+                        ${{enabled && hasKey ? '<span class="badge badge-green">ACTIVE</span>' :
+                          !enabled ? '<span class="badge" style="background:#4b5563">DISABLED</span>' :
+                          '<span class="badge badge-yellow">NO KEYS</span>'}}
+                    </div>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);cursor:pointer">
+                        <input type="checkbox" id="slot-enabled-${{i}}" ${{enabled ? 'checked' : ''}}
+                               onchange="updateSlotStatus(${{i}})"
+                               style="accent-color:var(--green)"> Enabled
+                    </label>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+                    <div>
+                        <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">MODEL</label>
+                        <select id="slot-model-${{i}}" style="width:100%"
+                                onchange="updateSlotStatus(${{i}})">
+                            ${{available.map(m => `<option value="${{m}}" ${{slot.model === m ? 'selected' : ''}}>${{m.toUpperCase()}}</option>`).join('')}}
+                        </select>
+                    </div>
+                    <div style="display:flex;align-items:flex-end;gap:6px">
+                        <div style="flex:1">
+                            <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">STATUS</label>
+                            <div id="slot-status-${{i}}" style="font-size:12px;padding:6px 0">
+                                ${{modelExists ? '<span class="green">Model file found</span>' : '<span class="red">Model file missing</span>'}}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+                    <div>
+                        <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">ALPACA API KEY</label>
+                        <input type="text" id="slot-key-${{i}}" value="${{slot.alpaca_key || ''}}"
+                               placeholder="PK..."
+                               style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
+                                      padding:6px 10px;border-radius:6px;font-size:12px;font-family:var(--mono)">
+                    </div>
+                    <div>
+                        <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">ALPACA SECRET KEY</label>
+                        <input type="password" id="slot-secret-${{i}}" value="${{slot.alpaca_secret || ''}}"
+                               placeholder="Secret..."
+                               style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
+                                      padding:6px 10px;border-radius:6px;font-size:12px;font-family:var(--mono)">
+                    </div>
+                </div>
+
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+                    <button class="btn btn-secondary" onclick="testKey(${{i}})" style="font-size:11px;padding:5px 12px">
+                        Test Key
+                    </button>
+                    <span id="slot-test-${{i}}" style="font-size:11px"></span>
+                </div>
+
+                <div style="border-top:1px solid var(--card-border);padding-top:10px">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);cursor:pointer">
+                        <input type="checkbox" id="slot-cutloss-${{i}}" ${{slot.enable_cutloss ? 'checked' : ''}}
+                               style="accent-color:var(--yellow)"
+                               onchange="toggleCutloss(${{i}})"> Enable Cut-Loss Protection
+                    </label>
+                    <div id="slot-cutloss-config-${{i}}" style="display:${{slot.enable_cutloss ? 'grid' : 'none'}};
+                                grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px">
+                        <div>
+                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Hard Stop %</label>
+                            <input type="number" id="slot-hard-${{i}}" value="${{slot.cutloss_hard_stop || -8}}" step="0.5"
+                                   style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
+                                          padding:4px 8px;border-radius:4px;font-size:12px;font-family:var(--mono)">
+                        </div>
+                        <div>
+                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Trailing Stop %</label>
+                            <input type="number" id="slot-trail-${{i}}" value="${{slot.cutloss_trailing_stop || -5}}" step="0.5"
+                                   style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
+                                          padding:4px 8px;border-radius:4px;font-size:12px;font-family:var(--mono)">
+                        </div>
+                        <div>
+                            <label style="font-size:10px;color:var(--text-dim);display:block;margin-bottom:3px">Portfolio Stop %</label>
+                            <input type="number" id="slot-portfolio-${{i}}" value="${{slot.cutloss_portfolio_stop || -3}}" step="0.5"
+                                   style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
+                                          padding:4px 8px;border-radius:4px;font-size:12px;font-family:var(--mono)">
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }}
+
+        $('slots-container').innerHTML = html;
+    }}
+
+    function toggleCutloss(idx) {{
+        const checked = $(`slot-cutloss-${{idx}}`).checked;
+        $(`slot-cutloss-config-${{idx}}`).style.display = checked ? 'grid' : 'none';
+    }}
+
+    function updateSlotStatus(idx) {{
+        // Visual feedback only — actual save happens on button click
+    }}
+
+    async function testKey(idx) {{
+        const key = $(`slot-key-${{idx}}`).value.trim();
+        const secret = $(`slot-secret-${{idx}}`).value.trim();
+        const statusEl = $(`slot-test-${{idx}}`);
+
+        if (!key || !secret) {{
+            statusEl.innerHTML = '<span class="red">Enter both key and secret</span>';
+            return;
+        }}
+
+        statusEl.innerHTML = '<span class="spinner"></span> Testing...';
+
+        const resp = await fetch('/api/config/test-key', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ key, secret }})
+        }});
+        const result = await resp.json();
+
+        if (result.ok) {{
+            statusEl.innerHTML = `<span class="green">Connected!</span>
+                <span style="color:var(--text-dim);margin-left:6px">
+                    Equity: ${{fmt$(result.equity)}} &middot; Cash: ${{fmt$(result.cash)}} &middot;
+                    Account: ${{result.account_number}}
+                </span>`;
+        }} else {{
+            statusEl.innerHTML = `<span class="red">Failed: ${{result.error}}</span>`;
+        }}
+    }}
+
+    async function saveConfig() {{
+        const slots = [];
+        for (let i = 0; i < 3; i++) {{
+            slots.push({{
+                slot_id: i + 1,
+                model: $(`slot-model-${{i}}`).value,
+                enabled: $(`slot-enabled-${{i}}`).checked,
+                alpaca_key: $(`slot-key-${{i}}`).value.trim(),
+                alpaca_secret: $(`slot-secret-${{i}}`).value.trim(),
+                enable_cutloss: $(`slot-cutloss-${{i}}`).checked,
+                cutloss_hard_stop: parseFloat($(`slot-hard-${{i}}`).value) || -8.0,
+                cutloss_trailing_stop: parseFloat($(`slot-trail-${{i}}`).value) || -5.0,
+                cutloss_portfolio_stop: parseFloat($(`slot-portfolio-${{i}}`).value) || -3.0,
+            }});
+        }}
+
+        $('save-status').innerHTML = '<span class="spinner"></span> Saving...';
+
+        const resp = await fetch('/api/config/models', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ slots }})
+        }});
+        const result = await resp.json();
+
+        if (result.ok) {{
+            $('save-status').innerHTML = '<span class="green">Saved! Reload page to see changes.</span>';
+            setTimeout(() => window.location.reload(), 1500);
+        }} else {{
+            $('save-status').innerHTML = `<span class="red">Error: ${{result.error}}</span>`;
+        }}
     }}
 
     // ── Init ────────────────────────────────────────────
