@@ -238,7 +238,7 @@ MODEL_REGISTRY = {
     "v4": {"feature_version": "v4", "model_dir": "v4", "fallback_model": "ml_v4_model.pkl"},
     "v5": {"feature_version": "v5", "model_dir": "v5", "fallback_model": None},
     "v6": {"feature_version": "v6", "model_dir": "v6", "fallback_model": None},
-    "v7": {"feature_version": "v6", "model_dir": "v6", "fallback_model": None},  # reuses v6 model
+    "v7": {"feature_version": "v6", "model_dir": "v7", "fallback_model": None},  # same model as v6, with cut-loss
 }
 
 CONFIG_PATH = DATA_DIR / "model_config.json"
