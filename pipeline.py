@@ -226,6 +226,30 @@ MODEL_DESCRIPTIONS = {
         "training": "Uses same V6 model file — no retraining needed. Risk management "
                     "is purely rule-based on live price data.",
     },
+    "v8": {
+        "title": "V8 — Sector-Neutral Stacked Ensemble",
+        "summary": "Same stacked ensemble as V6, but forces sector diversification. "
+                   "Max 3 stocks from any single GICS sector in the portfolio. "
+                   "Prevents concentration risk (e.g. V6's semis overweight).",
+        "architecture": "Same as V6 (5 base models + Ridge meta-learner). Adds sector "
+                        "classification layer and constrained portfolio construction. "
+                        "Also includes 3 sector-relative features.",
+        "features": "133 features: 130 V6 features + 3 sector-relative features "
+                    "(sector_rel_ret_5, sector_rel_ret_20, sector_rel_vol_20). "
+                    "Sector-relative features measure stock performance vs its "
+                    "sector ETF (XLK, XLF, XLV, etc.).",
+        "portfolio": "Sector-constrained conviction-weighted top 20: same conviction "
+                     "sizing as V6, but capped at 3 stocks per GICS sector. Skips "
+                     "lower-ranked stocks from overrepresented sectors and fills "
+                     "with next-best from underrepresented sectors.",
+        "risk": "Market regime filter (same as V6): composite score from VIX, "
+                "SPY trend, SPY momentum, HYG credit → exposure multiplier 0.4-1.0. "
+                "Sector diversification itself is a risk management layer — limits "
+                "blow-up from any single sector drawdown.",
+        "training": "Trained on same data as V6. Sector map cached from yfinance. "
+                    "Walk-forward validation with sector-neutral portfolio evaluation "
+                    "at each fold (HHI concentration metric tracked).",
+    },
 }
 
 
@@ -239,6 +263,7 @@ MODEL_REGISTRY = {
     "v5": {"feature_version": "v5", "model_dir": "v5", "fallback_model": None},
     "v6": {"feature_version": "v6", "model_dir": "v6", "fallback_model": None},
     "v7": {"feature_version": "v6", "model_dir": "v7", "fallback_model": None},  # same model as v6, with cut-loss
+    "v8": {"feature_version": "v8", "model_dir": "v8", "fallback_model": None},  # sector-neutral v6 ensemble
 }
 
 CONFIG_PATH = DATA_DIR / "model_config.json"
@@ -1307,10 +1332,66 @@ def conviction_weights(
     return {sym: round(float(w), 6) for (sym, _), w in zip(top, capped)}
 
 
+def sector_neutral_weights(
+    predictions: list[tuple[str, float]],
+    sector_map: dict[str, str],
+    top_n: int = 20,
+    max_per_sector: int = 3,
+    max_weight_multiple: float = 2.0,
+    regime_exposure: float = 1.0,
+) -> dict[str, float]:
+    """Sector-constrained conviction-weighted portfolio (V8).
+
+    Same as conviction_weights but caps at max_per_sector stocks from any
+    single GICS sector. Skips lower-ranked stocks from overrepresented
+    sectors and fills with next-best from underrepresented sectors.
+    """
+    if not predictions:
+        return {}
+
+    selected = []
+    sector_counts = {}
+
+    for sym, pred in predictions:
+        if len(selected) >= top_n:
+            break
+        sector = sector_map.get(sym, "Unknown")
+        count = sector_counts.get(sector, 0)
+        if count < max_per_sector:
+            selected.append((sym, pred))
+            sector_counts[sector] = count + 1
+
+    if not selected:
+        return {}
+
+    preds = np.array([p for _, p in selected])
+    preds_shifted = preds - preds.min() + 0.01
+    raw_weights = preds_shifted / preds_shifted.sum()
+
+    equal_weight = 1.0 / len(selected)
+    max_weight = equal_weight * max_weight_multiple
+    capped = np.minimum(raw_weights, max_weight)
+    capped = capped / capped.sum() * regime_exposure
+
+    return {sym: round(float(w), 6) for (sym, _), w in zip(selected, capped)}
+
+
+def _load_sector_map_for_pipeline() -> dict:
+    """Load cached sector map for pipeline use. Returns empty dict if not found."""
+    sector_cache = DATA_DIR / "sector_map.json"
+    if sector_cache.exists():
+        try:
+            with open(sector_cache) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
 def _get_feature_func(feature_version: str):
     """Return the appropriate feature computation function for a model version."""
-    if feature_version in ("v5", "v6"):
-        # v5 features are a subset of v6; extra features get ignored
+    if feature_version in ("v5", "v6", "v8"):
+        # v5 features are a subset of v6; v8 uses v6 base + sector-relative
         return compute_stock_features_v6
     else:
         return compute_stock_features
@@ -1980,12 +2061,13 @@ def run_single_model(
     for i, (sym, pred) in enumerate(rankings[:TOP_N]):
         logger.info(f"    {i+1:2d}. {sym:6s}  pred={pred:+6.2f}%")
 
-    # -- V6: Compute regime score & conviction weights --
+    # -- V6/V8: Compute regime score & conviction weights --
     tw = None  # target_weights: None = equal-weight (v4/v5 default)
     regime_exposure = 1.0
 
-    if mc.feature_version == "v6" and macro_data is not None:
-        logger.info("\n  [V6] Computing market regime & conviction weights...")
+    if mc.feature_version in ("v6", "v8") and macro_data is not None:
+        vtag = mc.feature_version.upper()
+        logger.info(f"\n  [{vtag}] Computing market regime & conviction weights...")
         try:
             regime_score = compute_live_regime_score(macro_data)
             regime_exposure = regime_to_exposure(regime_score)
@@ -1994,18 +2076,57 @@ def run_single_model(
                 else "HOSTILE" if regime_score < -0.3
                 else "NEUTRAL"
             )
-            logger.info(f"  [V6] Regime score: {regime_score:+.3f} ({regime_label})")
-            logger.info(f"  [V6] Exposure multiplier: {regime_exposure:.2f}")
+            logger.info(f"  [{vtag}] Regime score: {regime_score:+.3f} ({regime_label})")
+            logger.info(f"  [{vtag}] Exposure multiplier: {regime_exposure:.2f}")
 
-            tw = conviction_weights(
-                rankings, top_n=TOP_N,
-                max_weight_multiple=2.0,
-                regime_exposure=regime_exposure,
-            )
+            if mc.feature_version == "v8":
+                # V8: sector-neutral conviction weights
+                sector_map = _load_sector_map_for_pipeline()
+                if not sector_map:
+                    # Try loading from model bundle
+                    try:
+                        model_path = _resolve_model_path(mc.name)
+                        with open(model_path, "rb") as f:
+                            bundle = pickle.load(f)
+                        sector_map = bundle.get("sector_map", {})
+                    except Exception:
+                        pass
+
+                max_per_sector = 3
+                # Check model bundle for sector_config
+                try:
+                    model_path = _resolve_model_path(mc.name)
+                    with open(model_path, "rb") as f:
+                        bundle = pickle.load(f)
+                    sc = bundle.get("sector_config", {})
+                    max_per_sector = sc.get("max_per_sector", 3)
+                except Exception:
+                    pass
+
+                tw = sector_neutral_weights(
+                    rankings, sector_map,
+                    top_n=TOP_N,
+                    max_per_sector=max_per_sector,
+                    max_weight_multiple=2.0,
+                    regime_exposure=regime_exposure,
+                )
+                # Log sector distribution
+                sector_counts = {}
+                for sym_s in tw:
+                    sec = sector_map.get(sym_s, "Unknown")
+                    sector_counts[sec] = sector_counts.get(sec, 0) + 1
+                logger.info(f"  [V8] Sector distribution: {sector_counts}")
+            else:
+                tw = conviction_weights(
+                    rankings, top_n=TOP_N,
+                    max_weight_multiple=2.0,
+                    regime_exposure=regime_exposure,
+                )
+
             total_alloc = sum(tw.values())
             max_w = max(tw.values()) if tw else 0
             min_w = min(tw.values()) if tw else 0
-            logger.info(f"  [V6] Conviction weights: total_alloc={total_alloc:.4f}, "
+            logger.info(f"  [{vtag}] Conviction weights: total_alloc={total_alloc:.4f}, "
                         f"max={max_w:.4f}, min={min_w:.4f}")
             for sym_w, w in sorted(tw.items(), key=lambda x: -x[1])[:5]:
                 logger.info(f"    {sym_w:6s}  weight={w:.4f}")
@@ -2022,12 +2143,12 @@ def run_single_model(
                 "conviction_weights": {s: round(w, 6) for s, w in tw.items()},
             })
         except Exception as e:
-            logger.warning(f"  [V6] Regime/conviction failed, falling back to "
+            logger.warning(f"  [{vtag}] Regime/conviction failed, falling back to "
                           f"equal-weight: {e}")
-            report.add_error(f"V6 regime computation failed: {e}")
+            report.add_error(f"{vtag} regime computation failed: {e}")
             tw = None
-    elif mc.feature_version == "v6":
-        logger.warning("  [V6] No macro_data available for regime - using equal-weight")
+    elif mc.feature_version in ("v6", "v8"):
+        logger.warning(f"  [{mc.feature_version.upper()}] No macro_data available for regime - using equal-weight")
 
     # -- Step 5: Rebalance --
     logger.info("\n[5/5] REBALANCING PORTFOLIO")

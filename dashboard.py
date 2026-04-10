@@ -1680,7 +1680,7 @@ def index():
     }}
 
     function renderSlots(config) {{
-        const available = config.available_models || ['v4','v5','v6','v7'];
+        const available = config.available_models || ['v4','v5','v6','v7','v8'];
         const slots = config.slots || [];
         let html = '';
 
