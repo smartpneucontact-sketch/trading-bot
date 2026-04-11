@@ -835,47 +835,75 @@ def _cors_response(data, status=200):
 
 @app.route("/api/v1/models", methods=["GET", "OPTIONS"])
 def apiv1_models():
-    """List all active models with basic info."""
+    """List ALL registered models (V4-V8+) with status info."""
     if flask_request.method == "OPTIONS":
         return _cors_response({})
+
+    active_names = {mc.name for mc in pipeline.get_active_models()}
+    active_map = {mc.name: mc for mc in pipeline.get_active_models()}
+
     models = []
-    for mc in pipeline.get_active_models():
-        state = _load_model_state(mc.name)
-        desc = pipeline.MODEL_DESCRIPTIONS.get(mc.name, {})
-        models.append({
-            "name": mc.name,
-            "title": desc.get("title", mc.name.upper()),
-            "feature_version": mc.feature_version,
+    for name, reg in pipeline.MODEL_REGISTRY.items():
+        desc = pipeline.MODEL_DESCRIPTIONS.get(name, {})
+        state = _load_model_state(name)
+        mc = active_map.get(name)
+
+        entry = {
+            "name": name,
+            "title": desc.get("title", name.upper()),
+            "feature_version": reg.get("feature_version", name),
+            "active": name in active_names,
             "run_count": state.get("run_count", 0),
             "last_rebalance": state.get("last_rebalance"),
-            "enable_cutloss": mc.enable_cutloss,
-        })
-    return _cors_response({"models": models})
+        }
+        if mc:
+            entry["enable_cutloss"] = mc.enable_cutloss
+            entry["has_alpaca_keys"] = bool(mc.alpaca_key)
+        else:
+            entry["enable_cutloss"] = False
+            entry["has_alpaca_keys"] = False
+
+        models.append(entry)
+
+    return _cors_response({"models": models, "total": len(models), "active_count": len(active_names)})
 
 
 @app.route("/api/v1/models/<model_name>", methods=["GET", "OPTIONS"])
 def apiv1_model_detail(model_name):
-    """Full detail for a single model: description, account, positions, recent trades."""
+    """Full detail for a single model: description, state, account, positions.
+
+    Works for ANY registered model (V4-V8+). Alpaca data only available
+    for models that are active (assigned to a slot with API keys).
+    """
     if flask_request.method == "OPTIONS":
         return _cors_response({})
-    mc = _get_model_config(model_name)
-    if not mc:
-        return _cors_response({"error": f"Model {model_name} not found"}, 404)
 
+    # Check if model exists in registry at all
+    if model_name not in pipeline.MODEL_REGISTRY:
+        return _cors_response({"error": f"Model {model_name} not found in registry"}, 404)
+
+    mc = _get_model_config(model_name)  # None if not active
     logger = logging.getLogger("dashboard")
-    result = {"name": model_name}
 
-    # Description
+    result = {
+        "name": model_name,
+        "active": mc is not None,
+        "registry": pipeline.MODEL_REGISTRY.get(model_name, {}),
+    }
+
+    # Description (always available)
     desc = pipeline.MODEL_DESCRIPTIONS.get(model_name, {})
     result["description"] = desc
 
-    # State
+    # State (always available — from state file on disk)
     state = _load_model_state(model_name)
     result["run_count"] = state.get("run_count", 0)
     result["last_rebalance"] = state.get("last_rebalance")
+    result["last_run"] = state.get("last_run")
 
-    # Latest portfolio picks
+    # Full run history
     history = state.get("history", [])
+    result["history_count"] = len(history)
     if history:
         latest = history[-1]
         result["latest_picks"] = {
@@ -885,34 +913,54 @@ def apiv1_model_detail(model_name):
             "conviction_weights": latest.get("conviction_weights", {}),
             "regime_exposure": latest.get("regime_exposure"),
         }
+        result["history"] = history[-20:]  # Last 20 runs
 
-    # Account (live from Alpaca)
-    try:
-        acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
-        result["account"] = {
-            "equity": float(acct.get("equity", 0)),
-            "cash": float(acct.get("cash", 0)),
-            "portfolio_value": float(acct.get("portfolio_value", 0)),
-            "buying_power": float(acct.get("buying_power", 0)),
-            "long_market_value": float(acct.get("long_market_value", 0)),
-        }
-    except Exception:
+    # Recent trades (from journal — always available if file exists)
+    trades = _load_recent_trades(model_name, 50)
+    result["trade_count"] = len(trades)
+
+    # Alpaca data (only if model is active with keys)
+    if mc:
+        result["enable_cutloss"] = mc.enable_cutloss
+        if mc.enable_cutloss:
+            result["cutloss_config"] = {
+                "hard_stop": mc.cutloss_hard_stop,
+                "trailing_stop": mc.cutloss_trailing_stop,
+                "portfolio_stop": mc.cutloss_portfolio_stop,
+            }
+
+        # Account
+        try:
+            acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
+            result["account"] = {
+                "equity": float(acct.get("equity", 0)),
+                "cash": float(acct.get("cash", 0)),
+                "portfolio_value": float(acct.get("portfolio_value", 0)),
+                "buying_power": float(acct.get("buying_power", 0)),
+                "long_market_value": float(acct.get("long_market_value", 0)),
+                "last_equity": float(acct.get("last_equity", 0)),
+            }
+        except Exception:
+            result["account"] = None
+
+        # Positions
+        try:
+            positions = pipeline.alpaca_request("GET", "v2/positions", mc, logger=logger)
+            result["positions"] = [{
+                "symbol": p["symbol"],
+                "qty": float(p["qty"]),
+                "market_value": float(p["market_value"]),
+                "unrealized_pl": float(p["unrealized_pl"]),
+                "unrealized_plpc": round(float(p.get("unrealized_plpc", 0)) * 100, 2),
+                "avg_entry_price": float(p.get("avg_entry_price", 0)),
+                "current_price": float(p.get("current_price", 0)),
+            } for p in positions]
+        except Exception:
+            result["positions"] = None
+    else:
         result["account"] = None
-
-    # Positions (live from Alpaca)
-    try:
-        positions = pipeline.alpaca_request("GET", "v2/positions", mc, logger=logger)
-        result["positions"] = [{
-            "symbol": p["symbol"],
-            "qty": float(p["qty"]),
-            "market_value": float(p["market_value"]),
-            "unrealized_pl": float(p["unrealized_pl"]),
-            "unrealized_plpc": round(float(p.get("unrealized_plpc", 0)) * 100, 2),
-            "avg_entry_price": float(p.get("avg_entry_price", 0)),
-            "current_price": float(p.get("current_price", 0)),
-        } for p in positions]
-    except Exception:
         result["positions"] = None
+        result["note"] = "Model not active (not assigned to a trading slot). No live Alpaca data."
 
     return _cors_response(result)
 
@@ -1119,10 +1167,19 @@ def apiv1_docs():
                 "description": "Performance benchmark: model returns vs universe average",
             },
         ],
-        "model_names": [mc.name for mc in pipeline.get_active_models()],
+        "all_models": list(pipeline.MODEL_REGISTRY.keys()),
+        "active_models": [mc.name for mc in pipeline.get_active_models()],
+        "notes": [
+            "All endpoints under /api/v1/ are read-only with CORS enabled.",
+            "/api/v1/models lists ALL registered models (V4-V8+), not just active ones.",
+            "/api/v1/models/<name> returns description, run history, and predictions for ANY registered model.",
+            "Alpaca live data (account, positions, trades, equity) only available for models assigned to a trading slot.",
+            "New models added to MODEL_REGISTRY automatically appear in the API — no code changes needed.",
+        ],
         "examples": [
             f"{base_url}/api/v1/models",
             f"{base_url}/api/v1/models/v6",
+            f"{base_url}/api/v1/models/v8",
             f"{base_url}/api/v1/positions/v6",
             f"{base_url}/api/v1/trades/v6?limit=20",
             f"{base_url}/api/v1/equity/v6?period=3M",
