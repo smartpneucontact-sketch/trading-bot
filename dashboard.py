@@ -819,6 +819,318 @@ def trigger_run():
     return jsonify({"status": "triggered", "model": model_filter or "all", "dry": dry})
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# EXTERNAL API — /api/v1/ (read-only, CORS-enabled, no auth)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _cors_response(data, status=200):
+    """Wrap jsonify response with CORS headers for external access."""
+    resp = jsonify(data)
+    resp.status_code = status
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
+@app.route("/api/v1/models", methods=["GET", "OPTIONS"])
+def apiv1_models():
+    """List all active models with basic info."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    models = []
+    for mc in pipeline.get_active_models():
+        state = _load_model_state(mc.name)
+        desc = pipeline.MODEL_DESCRIPTIONS.get(mc.name, {})
+        models.append({
+            "name": mc.name,
+            "title": desc.get("title", mc.name.upper()),
+            "feature_version": mc.feature_version,
+            "run_count": state.get("run_count", 0),
+            "last_rebalance": state.get("last_rebalance"),
+            "enable_cutloss": mc.enable_cutloss,
+        })
+    return _cors_response({"models": models})
+
+
+@app.route("/api/v1/models/<model_name>", methods=["GET", "OPTIONS"])
+def apiv1_model_detail(model_name):
+    """Full detail for a single model: description, account, positions, recent trades."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    mc = _get_model_config(model_name)
+    if not mc:
+        return _cors_response({"error": f"Model {model_name} not found"}, 404)
+
+    logger = logging.getLogger("dashboard")
+    result = {"name": model_name}
+
+    # Description
+    desc = pipeline.MODEL_DESCRIPTIONS.get(model_name, {})
+    result["description"] = desc
+
+    # State
+    state = _load_model_state(model_name)
+    result["run_count"] = state.get("run_count", 0)
+    result["last_rebalance"] = state.get("last_rebalance")
+
+    # Latest portfolio picks
+    history = state.get("history", [])
+    if history:
+        latest = history[-1]
+        result["latest_picks"] = {
+            "date": latest.get("date"),
+            "symbols": latest.get("target_symbols", []),
+            "predictions": latest.get("predictions", {}),
+            "conviction_weights": latest.get("conviction_weights", {}),
+            "regime_exposure": latest.get("regime_exposure"),
+        }
+
+    # Account (live from Alpaca)
+    try:
+        acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
+        result["account"] = {
+            "equity": float(acct.get("equity", 0)),
+            "cash": float(acct.get("cash", 0)),
+            "portfolio_value": float(acct.get("portfolio_value", 0)),
+            "buying_power": float(acct.get("buying_power", 0)),
+            "long_market_value": float(acct.get("long_market_value", 0)),
+        }
+    except Exception:
+        result["account"] = None
+
+    # Positions (live from Alpaca)
+    try:
+        positions = pipeline.alpaca_request("GET", "v2/positions", mc, logger=logger)
+        result["positions"] = [{
+            "symbol": p["symbol"],
+            "qty": float(p["qty"]),
+            "market_value": float(p["market_value"]),
+            "unrealized_pl": float(p["unrealized_pl"]),
+            "unrealized_plpc": round(float(p.get("unrealized_plpc", 0)) * 100, 2),
+            "avg_entry_price": float(p.get("avg_entry_price", 0)),
+            "current_price": float(p.get("current_price", 0)),
+        } for p in positions]
+    except Exception:
+        result["positions"] = None
+
+    return _cors_response(result)
+
+
+@app.route("/api/v1/positions/<model_name>", methods=["GET", "OPTIONS"])
+def apiv1_positions(model_name):
+    """Live positions for a model."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    mc = _get_model_config(model_name)
+    if not mc:
+        return _cors_response({"error": f"Model {model_name} not found"}, 404)
+
+    logger = logging.getLogger("dashboard")
+    try:
+        positions = pipeline.alpaca_request("GET", "v2/positions", mc, logger=logger)
+        data = [{
+            "symbol": p["symbol"],
+            "qty": float(p["qty"]),
+            "market_value": float(p["market_value"]),
+            "cost_basis": float(p.get("cost_basis", 0)),
+            "unrealized_pl": float(p["unrealized_pl"]),
+            "unrealized_plpc": round(float(p.get("unrealized_plpc", 0)) * 100, 2),
+            "avg_entry_price": float(p.get("avg_entry_price", 0)),
+            "current_price": float(p.get("current_price", 0)),
+            "change_today": round(float(p.get("change_today", 0)) * 100, 2),
+        } for p in positions]
+        data.sort(key=lambda x: x["market_value"], reverse=True)
+        total_value = sum(p["market_value"] for p in data)
+        total_pl = sum(p["unrealized_pl"] for p in data)
+        return _cors_response({
+            "model": model_name,
+            "count": len(data),
+            "total_market_value": round(total_value, 2),
+            "total_unrealized_pl": round(total_pl, 2),
+            "positions": data,
+        })
+    except Exception as e:
+        return _cors_response({"error": str(e)}, 500)
+
+
+@app.route("/api/v1/trades/<model_name>", methods=["GET", "OPTIONS"])
+def apiv1_trades(model_name):
+    """Recent trades for a model."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    limit = int(flask_request.args.get("limit", 50))
+    trades = _load_recent_trades(model_name, limit)
+
+    if not trades:
+        mc = _get_model_config(model_name)
+        if mc:
+            try:
+                logger = logging.getLogger("dashboard")
+                orders = pipeline.alpaca_request(
+                    "GET", "v2/orders?status=all&limit=100&direction=desc",
+                    mc, logger=logger
+                )
+                trades = []
+                for o in orders:
+                    filled_qty = float(o.get("filled_qty", 0) or 0)
+                    filled_price = float(o.get("filled_avg_price", 0) or 0)
+                    notional = round(filled_qty * filled_price, 2) if filled_price else 0
+                    trades.append({
+                        "timestamp": o.get("filled_at") or o.get("submitted_at") or o.get("created_at", ""),
+                        "symbol": o.get("symbol", ""),
+                        "side": o.get("side", ""),
+                        "qty": filled_qty,
+                        "price": filled_price,
+                        "notional": notional,
+                        "status": o.get("status", ""),
+                        "order_type": o.get("type", ""),
+                    })
+                trades = trades[:limit]
+            except Exception:
+                trades = []
+
+    return _cors_response({
+        "model": model_name,
+        "count": len(trades),
+        "trades": trades,
+    })
+
+
+@app.route("/api/v1/account/<model_name>", methods=["GET", "OPTIONS"])
+def apiv1_account(model_name):
+    """Live Alpaca account info for a model."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    mc = _get_model_config(model_name)
+    if not mc:
+        return _cors_response({"error": f"Model {model_name} not found"}, 404)
+
+    logger = logging.getLogger("dashboard")
+    try:
+        acct = pipeline.alpaca_request("GET", "v2/account", mc, logger=logger)
+        return _cors_response({
+            "model": model_name,
+            "equity": float(acct.get("equity", 0)),
+            "cash": float(acct.get("cash", 0)),
+            "portfolio_value": float(acct.get("portfolio_value", 0)),
+            "buying_power": float(acct.get("buying_power", 0)),
+            "long_market_value": float(acct.get("long_market_value", 0)),
+            "last_equity": float(acct.get("last_equity", 0)),
+            "status": acct.get("status", "unknown"),
+        })
+    except Exception as e:
+        return _cors_response({"error": str(e)}, 500)
+
+
+@app.route("/api/v1/equity/<model_name>", methods=["GET", "OPTIONS"])
+def apiv1_equity(model_name):
+    """Equity curve (portfolio history) for a model."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    mc = _get_model_config(model_name)
+    if not mc:
+        return _cors_response({"error": f"Model {model_name} not found"}, 404)
+
+    period = flask_request.args.get("period", "1M")
+    logger = logging.getLogger("dashboard")
+    try:
+        hist = pipeline.alpaca_request(
+            "GET",
+            f"v2/account/portfolio/history?period={period}&timeframe=1D&extended_hours=false",
+            mc, logger=logger
+        )
+        return _cors_response({
+            "model": model_name,
+            "period": period,
+            "timestamps": hist.get("timestamp", []),
+            "equity": hist.get("equity", []),
+            "profit_loss": hist.get("profit_loss", []),
+            "profit_loss_pct": hist.get("profit_loss_pct", []),
+            "base_value": hist.get("base_value", 0),
+        })
+    except Exception as e:
+        return _cors_response({"error": str(e)}, 500)
+
+
+@app.route("/api/v1/performance/<model_name>", methods=["GET", "OPTIONS"])
+def apiv1_performance(model_name):
+    """Performance benchmark: model vs universe."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    try:
+        result = _compute_performance(model_name)
+        return _cors_response(result)
+    except Exception as e:
+        return _cors_response({"error": str(e)}, 500)
+
+
+@app.route("/api/v1/docs", methods=["GET", "OPTIONS"])
+def apiv1_docs():
+    """API documentation."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+
+    base_url = flask_request.url_root.rstrip("/")
+    docs = {
+        "name": "ML Trading Bot API",
+        "version": "v1",
+        "description": "Read-only API for accessing trading bot data. CORS enabled, no authentication required.",
+        "base_url": f"{base_url}/api/v1",
+        "endpoints": [
+            {
+                "path": "/api/v1/docs",
+                "method": "GET",
+                "description": "This documentation page",
+            },
+            {
+                "path": "/api/v1/models",
+                "method": "GET",
+                "description": "List all active models with basic info (name, title, run count)",
+            },
+            {
+                "path": "/api/v1/models/<model_name>",
+                "method": "GET",
+                "description": "Full detail for one model: description, account, positions, latest picks",
+            },
+            {
+                "path": "/api/v1/account/<model_name>",
+                "method": "GET",
+                "description": "Live Alpaca account info (equity, cash, buying power)",
+            },
+            {
+                "path": "/api/v1/positions/<model_name>",
+                "method": "GET",
+                "description": "Live positions with P&L. Returns count, total value, and per-position detail",
+            },
+            {
+                "path": "/api/v1/trades/<model_name>",
+                "method": "GET",
+                "description": "Recent trades. Optional ?limit=N (default 50)",
+            },
+            {
+                "path": "/api/v1/equity/<model_name>",
+                "method": "GET",
+                "description": "Equity curve over time. Optional ?period=1D|1W|1M|3M|1A|all (default 1M)",
+            },
+            {
+                "path": "/api/v1/performance/<model_name>",
+                "method": "GET",
+                "description": "Performance benchmark: model returns vs universe average",
+            },
+        ],
+        "model_names": [mc.name for mc in pipeline.get_active_models()],
+        "examples": [
+            f"{base_url}/api/v1/models",
+            f"{base_url}/api/v1/models/v6",
+            f"{base_url}/api/v1/positions/v6",
+            f"{base_url}/api/v1/trades/v6?limit=20",
+            f"{base_url}/api/v1/equity/v6?period=3M",
+        ],
+    }
+    return _cors_response(docs)
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "uptime_since": bot_status["started_at"]})
