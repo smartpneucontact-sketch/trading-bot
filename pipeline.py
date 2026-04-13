@@ -1994,15 +1994,31 @@ def run_single_model(
         logger.info(report.format_summary())
         return
 
-    # Custom unpickler to resolve classes saved from __main__ (e.g. train_ml_v6.py)
+    # Custom unpickler to resolve classes saved from training scripts
+    # Models may be pickled with module="__main__" (direct script run) or
+    # module="scripts.train_ml_v6" etc. (run via python -m). Map all to
+    # the pipeline-local class definitions so deserialization works on Railway.
     class _PipelineUnpickler(pickle.Unpickler):
         _class_map = {
             "StackedEnsemble": StackedEnsemble,
             "EnsembleModel": EnsembleModel,
         }
+        _known_training_modules = {
+            "__main__",
+            "scripts.train_ml_v4",
+            "scripts.train_ml_v5",
+            "scripts.train_ml_v6",
+            "scripts.train_ml_v7",
+            "scripts.train_ml_v8",
+            "train_ml_v4",
+            "train_ml_v5",
+            "train_ml_v6",
+            "train_ml_v7",
+            "train_ml_v8",
+        }
 
         def find_class(self, module, name):
-            if module == "__main__" and name in self._class_map:
+            if name in self._class_map and module in self._known_training_modules:
                 return self._class_map[name]
             return super().find_class(module, name)
 
