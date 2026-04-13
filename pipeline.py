@@ -2097,27 +2097,16 @@ def run_single_model(
 
             if mc.feature_version == "v8":
                 # V8: sector-neutral conviction weights
+                # Priority: 1) cached file on disk, 2) embedded in model bundle
                 sector_map = _load_sector_map_for_pipeline()
                 if not sector_map:
-                    # Try loading from model bundle
-                    try:
-                        model_path = _resolve_model_path(mc.name)
-                        with open(model_path, "rb") as f:
-                            bundle = pickle.load(f)
-                        sector_map = bundle.get("sector_map", {})
-                    except Exception:
-                        pass
+                    sector_map = model_bundle.get("sector_map", {})
+                if not sector_map:
+                    logger.warning(f"  [{vtag}] No sector map found! All stocks will be 'Unknown'.")
 
-                max_per_sector = 3
-                # Check model bundle for sector_config
-                try:
-                    model_path = _resolve_model_path(mc.name)
-                    with open(model_path, "rb") as f:
-                        bundle = pickle.load(f)
-                    sc = bundle.get("sector_config", {})
-                    max_per_sector = sc.get("max_per_sector", 3)
-                except Exception:
-                    pass
+                sc = model_bundle.get("sector_config", {})
+                max_per_sector = sc.get("max_per_sector", 3)
+                logger.info(f"  [{vtag}] Sector map: {len(sector_map)} stocks mapped, max {max_per_sector}/sector")
 
                 tw = sector_neutral_weights(
                     rankings, sector_map,
