@@ -1322,12 +1322,14 @@ def conviction_weights(
 
     preds = np.array([p for _, p in top])
     preds_shifted = preds - preds.min() + 0.01
-    raw_weights = preds_shifted / preds_shifted.sum()
+    denom = preds_shifted.sum()
+    raw_weights = preds_shifted / denom if denom > 0 else np.ones(len(preds)) / len(preds)
 
     equal_weight = 1.0 / top_n
     max_weight = equal_weight * max_weight_multiple
     capped = np.minimum(raw_weights, max_weight)
-    capped = capped / capped.sum() * regime_exposure
+    capped_sum = capped.sum()
+    capped = capped / capped_sum * regime_exposure if capped_sum > 0 else np.ones(len(capped)) / len(capped) * regime_exposure
 
     return {sym: round(float(w), 6) for (sym, _), w in zip(top, capped)}
 
@@ -1366,12 +1368,14 @@ def sector_neutral_weights(
 
     preds = np.array([p for _, p in selected])
     preds_shifted = preds - preds.min() + 0.01
-    raw_weights = preds_shifted / preds_shifted.sum()
+    denom = preds_shifted.sum()
+    raw_weights = preds_shifted / denom if denom > 0 else np.ones(len(preds)) / len(preds)
 
     equal_weight = 1.0 / len(selected)
     max_weight = equal_weight * max_weight_multiple
     capped = np.minimum(raw_weights, max_weight)
-    capped = capped / capped.sum() * regime_exposure
+    capped_sum = capped.sum()
+    capped = capped / capped_sum * regime_exposure if capped_sum > 0 else np.ones(len(capped)) / len(capped) * regime_exposure
 
     return {sym: round(float(w), 6) for (sym, _), w in zip(selected, capped)}
 
@@ -1604,11 +1608,11 @@ def alpaca_request(method: str, endpoint: str, mc: ModelConfig,
         logger.info(f"    API [{mc.name}]: {method} {endpoint}")
 
     if method == "GET":
-        resp = requests.get(url, headers=headers)
+        resp = requests.get(url, headers=headers, timeout=15)
     elif method == "POST":
-        resp = requests.post(url, headers=headers, json=data)
+        resp = requests.post(url, headers=headers, json=data, timeout=15)
     elif method == "DELETE":
-        resp = requests.delete(url, headers=headers)
+        resp = requests.delete(url, headers=headers, timeout=15)
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -1705,6 +1709,12 @@ def rebalance_portfolio(
     cash_available = float(acct["cash"])
     current_positions = get_positions(mc, logger)
     rb_data["positions_before"] = len(current_positions)
+
+    if not target_symbols:
+        logger.error(f"  [REBALANCE] {mc.name}: target_symbols is empty, aborting rebalance")
+        report.add_error("Rebalance cancelled: no target symbols")
+        report.end_step("rebalance")
+        return rb_data
 
     target_set = set(target_symbols)
     current_set = set(current_positions.keys())
@@ -1873,14 +1883,26 @@ def rebalance_portfolio(
         )
 
         try:
+            order_ok = False
             if order["action"] == "sell":
                 # Close entire position
-                alpaca_request("DELETE", f"v2/positions/{sym}", mc, logger=logger)
-                trade.order_status = "submitted"
+                resp = alpaca_request("DELETE", f"v2/positions/{sym}", mc, logger=logger)
+                # DELETE returns the closing order object (or empty on 204)
+                order_status = resp.get("status", "accepted") if resp else "accepted"
+                trade.order_id = resp.get("id") if resp else None
+                trade.order_status = order_status
                 trade.shares = order["qty"]
-                logger.info(f"    OK  EXIT  {sym:6s}: closed {order['qty']:.2f} shares, "
-                            f"P&L=${order.get('unrealized_pnl_usd', 0):+,.2f} "
-                            f"({order.get('unrealized_pnl_pct', 0):+.1f}%)")
+                if order_status in ("rejected", "canceled", "expired"):
+                    logger.error(f"    REJECTED EXIT {sym:6s}: status={order_status}, "
+                                 f"reason: {resp.get('reject_reason', 'unknown')}")
+                    trade.error_message = f"Order {order_status}: {resp.get('reject_reason', '')}"
+                    report.add_error(f"Order {order_status}: EXIT {sym} - {resp.get('reject_reason', '')}")
+                    failed += 1
+                else:
+                    order_ok = True
+                    logger.info(f"    OK  EXIT  {sym:6s}: closed {order['qty']:.2f} shares, "
+                                f"P&L=${order.get('unrealized_pnl_usd', 0):+,.2f} "
+                                f"({order.get('unrealized_pnl_pct', 0):+.1f}%)")
 
             elif order["action"] in ("buy_notional", "sell_notional"):
                 # Fractional notional order
@@ -1891,21 +1913,38 @@ def rebalance_portfolio(
                     "type": "market",
                     "time_in_force": "day",
                 }, logger=logger)
+                order_status = resp.get("status", "submitted")
                 trade.order_id = resp.get("id")
-                trade.order_status = resp.get("status", "submitted")
-                logger.info(
-                    f"    OK  {order['trade_action'].upper():16s} {sym:6s}: "
-                    f"{order['side']} ${order['notional']:,.2f}, "
-                    f"order_id={resp.get('id', '?')}, "
-                    f"status={resp.get('status', '?')}"
-                )
+                trade.order_status = order_status
 
-            executed += 1
-            total_notional += order["notional"]
-            if order["side"] == "buy":
-                buy_notional += order["notional"]
-            else:
-                sell_notional += order["notional"]
+                if order_status in ("rejected", "canceled", "expired"):
+                    logger.error(
+                        f"    REJECTED {order['trade_action'].upper():16s} {sym:6s}: "
+                        f"{order['side']} ${order['notional']:,.2f}, "
+                        f"status={order_status}, "
+                        f"reason: {resp.get('reject_reason', 'unknown')}"
+                    )
+                    trade.error_message = f"Order {order_status}: {resp.get('reject_reason', '')}"
+                    report.add_error(f"Order {order_status}: {order['trade_action']} {sym} - {resp.get('reject_reason', '')}")
+                    failed += 1
+                else:
+                    order_ok = True
+                    filled_qty = resp.get("filled_qty")
+                    filled_str = f", filled_qty={filled_qty}" if filled_qty and filled_qty != "0" else ""
+                    logger.info(
+                        f"    OK  {order['trade_action'].upper():16s} {sym:6s}: "
+                        f"{order['side']} ${order['notional']:,.2f}, "
+                        f"order_id={resp.get('id', '?')}, "
+                        f"status={order_status}{filled_str}"
+                    )
+
+            if order_ok:
+                executed += 1
+                total_notional += order["notional"]
+                if order["side"] == "buy":
+                    buy_notional += order["notional"]
+                else:
+                    sell_notional += order["notional"]
 
         except Exception as e:
             trade.order_status = "failed"
@@ -2031,7 +2070,8 @@ def run_single_model(
                 return self._class_map[name]
             return super().find_class(module, name)
 
-    model_bundle = _PipelineUnpickler(open(mc.model_path, "rb")).load()
+    with open(mc.model_path, "rb") as _model_fh:
+        model_bundle = _PipelineUnpickler(_model_fh).load()
     model = model_bundle["model"]
     feature_cols = model_bundle["feature_cols"]
     logger.info(f"  Model: {len(feature_cols)} features, "
@@ -2134,19 +2174,24 @@ def run_single_model(
                 if not sector_map:
                     sector_map = model_bundle.get("sector_map", {})
                 if not sector_map:
-                    logger.warning(f"  [{vtag}] No sector map found! All stocks will be 'Unknown'.")
+                    logger.warning(f"  [{vtag}] No sector map found! Falling back to conviction_weights (no sector constraint).")
+                    tw = conviction_weights(
+                        rankings, top_n=TOP_N,
+                        max_weight_multiple=2.0,
+                        regime_exposure=regime_exposure,
+                    )
+                else:
+                    sc = model_bundle.get("sector_config", {})
+                    max_per_sector = sc.get("max_per_sector", 3)
+                    logger.info(f"  [{vtag}] Sector map: {len(sector_map)} stocks mapped, max {max_per_sector}/sector")
 
-                sc = model_bundle.get("sector_config", {})
-                max_per_sector = sc.get("max_per_sector", 3)
-                logger.info(f"  [{vtag}] Sector map: {len(sector_map)} stocks mapped, max {max_per_sector}/sector")
-
-                tw = sector_neutral_weights(
-                    rankings, sector_map,
-                    top_n=TOP_N,
-                    max_per_sector=max_per_sector,
-                    max_weight_multiple=2.0,
-                    regime_exposure=regime_exposure,
-                )
+                    tw = sector_neutral_weights(
+                        rankings, sector_map,
+                        top_n=TOP_N,
+                        max_per_sector=max_per_sector,
+                        max_weight_multiple=2.0,
+                        regime_exposure=regime_exposure,
+                    )
                 # Log sector distribution
                 sector_counts = {}
                 for sym_s in tw:
@@ -2229,6 +2274,7 @@ _peak_lock = threading.Lock()
 
 # Track daily portfolio start values for portfolio-level stop
 _daily_portfolio_start: dict[str, float] = {}
+_daily_portfolio_lock = threading.Lock()
 
 
 def _is_market_open() -> bool:
@@ -2263,6 +2309,13 @@ def cutloss_scan():
     if not cutloss_models:
         return
 
+    # Periodically clean up stale _peak_prices entries (inactive models)
+    cutloss_model_names = {mc.name for mc in cutloss_models}
+    with _peak_lock:
+        stale_keys = [k for k in _peak_prices if k[0] not in cutloss_model_names]
+        for k in stale_keys:
+            del _peak_prices[k]
+
     for mc in cutloss_models:
         try:
             _cutloss_scan_model(mc, logger)
@@ -2287,16 +2340,21 @@ def _cutloss_scan_model(mc: ModelConfig, logger):
         acct = alpaca_request("GET", "v2/account", mc, logger=logger)
         current_equity = float(acct.get("equity", 0))
         last_equity = float(acct.get("last_equity", 0))
-    except Exception:
-        current_equity = last_equity = 0
+    except Exception as e:
+        logger.error(f"[CUTLOSS] {mc.name}: failed to fetch account: {e}")
+        return
 
     # Initialize daily start if needed (first scan of the day)
     today = datetime.now().strftime("%Y-%m-%d")
     daily_key = f"{mc.name}_{today}"
-    if daily_key not in _daily_portfolio_start and last_equity > 0:
-        _daily_portfolio_start[daily_key] = last_equity
-
-    start_equity = _daily_portfolio_start.get(daily_key, last_equity)
+    with _daily_portfolio_lock:
+        if daily_key not in _daily_portfolio_start and last_equity > 0:
+            _daily_portfolio_start[daily_key] = last_equity
+            # Purge stale keys (older than today) to prevent unbounded growth
+            stale = [k for k in _daily_portfolio_start if not k.endswith(today)]
+            for k in stale:
+                del _daily_portfolio_start[k]
+        start_equity = _daily_portfolio_start.get(daily_key, last_equity)
 
     # ── Portfolio-level stop check ───────────────────────────
     if start_equity > 0 and current_equity > 0:
@@ -2375,7 +2433,13 @@ def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
     try:
         result = alpaca_request("POST", "v2/orders", mc, data=order_data, logger=logger)
         order_id = result.get("id", "?")
-        logger.info(f"[CUTLOSS] {mc.name}: {symbol} sell order placed: {order_id}")
+        order_status = result.get("status", "submitted")
+
+        if order_status in ("rejected", "canceled", "expired"):
+            logger.error(f"[CUTLOSS] {mc.name}: {symbol} sell order {order_status}: "
+                         f"{result.get('reject_reason', 'unknown')}")
+        else:
+            logger.info(f"[CUTLOSS] {mc.name}: {symbol} sell order placed: {order_id}, status={order_status}")
 
         # Log to trade journal
         journal = TradeJournal(mc.name)
@@ -2389,15 +2453,17 @@ def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
             action=reason,
             order_type="market",
             notional_target=0,
-            order_status="submitted",
+            order_status=order_status,
             order_id=order_id,
+            error_message=result.get("reject_reason") if order_status in ("rejected", "canceled", "expired") else None,
             shares=qty,
         )
         journal.log(record)
 
-        # Clear peak tracking for this symbol
-        peak_key = (mc.name, symbol)
-        _peak_prices.pop(peak_key, None)
+        # Clear peak tracking for this symbol (only if order was accepted)
+        if order_status not in ("rejected", "canceled", "expired"):
+            peak_key = (mc.name, symbol)
+            _peak_prices.pop(peak_key, None)
 
     except Exception as e:
         logger.error(f"[CUTLOSS] {mc.name}: order failed for {symbol}: {e}")
@@ -2418,9 +2484,10 @@ def _liquidate_all(mc: ModelConfig, positions: list, reason: str, logger):
                 logger.error(f"[CUTLOSS] {mc.name}: failed to liquidate {sym}: {e}")
 
     # Clear all peak tracking for this model
-    keys_to_remove = [k for k in _peak_prices if k[0] == mc.name]
-    for k in keys_to_remove:
-        _peak_prices.pop(k, None)
+    with _peak_lock:
+        keys_to_remove = [k for k in _peak_prices if k[0] == mc.name]
+        for k in keys_to_remove:
+            _peak_prices.pop(k, None)
 
 
 def run_pipeline(dry_run: bool = False, force: bool = False,

@@ -52,6 +52,28 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 TRADE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Auth token for state-changing endpoints (set DASHBOARD_AUTH_TOKEN env var)
+import secrets as _secrets
+DASHBOARD_AUTH_TOKEN = os.environ.get("DASHBOARD_AUTH_TOKEN", None)
+
+
+def _check_auth() -> bool:
+    """Verify Authorization header matches expected token.
+    Returns True if no token is configured (local dev) or if token matches."""
+    if not DASHBOARD_AUTH_TOKEN:
+        return True  # No token set; skip auth for local dev
+    token = flask_request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    return _secrets.compare_digest(token, DASHBOARD_AUTH_TOKEN) if token else False
+
+
+def _validate_model_name(model_name: str) -> bool:
+    """Validate that model_name is a known registered model."""
+    if not model_name or not isinstance(model_name, str):
+        return False
+    if not all(c.isalnum() for c in model_name):
+        return False
+    return model_name in pipeline.MODEL_REGISTRY
+
 # In-memory store for live status
 bot_status = {
     "state": "idle",
@@ -68,22 +90,28 @@ bot_status = {
 status_lock = threading.Lock()
 
 # Simple cache for Alpaca data (avoid hammering API)
-_api_cache = {}
+from collections import OrderedDict
+_api_cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
 CACHE_TTL = 30  # seconds
+MAX_CACHE_SIZE = 500  # Maximum entries before LRU eviction
 
 
 def _cached_api_call(key, fn, ttl=CACHE_TTL):
-    """Cache API responses for ttl seconds."""
+    """Cache API responses for ttl seconds with LRU eviction."""
     with _cache_lock:
         if key in _api_cache:
             data, ts = _api_cache[key]
             if time.time() - ts < ttl:
+                _api_cache.move_to_end(key)
                 return data
     try:
         result = fn()
         with _cache_lock:
             _api_cache[key] = (result, time.time())
+            _api_cache.move_to_end(key)
+            while len(_api_cache) > MAX_CACHE_SIZE:
+                _api_cache.popitem(last=False)
         return result
     except Exception as e:
         logging.getLogger("dashboard").warning(f"API call failed ({key}): {e}")
@@ -200,14 +228,17 @@ def run_trading_pipeline(force=False, model_filter=None):
 
     except Exception as e:
         elapsed = time.time() - start_time
-        error_msg = f"{e}\n{traceback.format_exc()}"
+        full_error = f"{e}\n{traceback.format_exc()}"
+        # Sanitize: only store first line (exception message) in status,
+        # log full traceback to server logs only
+        safe_error = str(e).split("\n")[0][:500]
 
         with status_lock:
             bot_status["state"] = "error"
             bot_status["last_run_at"] = datetime.now().isoformat()
             bot_status["last_run_status"] = "error"
             bot_status["last_run_duration"] = round(elapsed, 1)
-            bot_status["last_error"] = error_msg
+            bot_status["last_error"] = safe_error
             bot_status["current_step"] = None
             bot_status["total_runs"] += 1
 
@@ -217,7 +248,7 @@ def run_trading_pipeline(force=False, model_filter=None):
                     bot_status["models"][mn]["state"] = "error"
                     bot_status["models"][mn]["last_run_status"] = "error"
 
-        logging.getLogger("dashboard").error(f"Pipeline failed: {error_msg}")
+        logging.getLogger("dashboard").error(f"Pipeline failed: {full_error}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -232,7 +263,7 @@ def handle_500(e):
     import traceback
     tb = traceback.format_exc()
     logging.getLogger("dashboard").error(f"500 error: {e}\n{tb}")
-    return jsonify({"error": str(e), "traceback": tb}), 500
+    return jsonify({"error": "Internal server error"}), 500
 
 
 @app.errorhandler(Exception)
@@ -240,7 +271,7 @@ def handle_exception(e):
     import traceback
     tb = traceback.format_exc()
     logging.getLogger("dashboard").error(f"Unhandled exception: {e}\n{tb}")
-    return jsonify({"error": str(e), "traceback": tb}), 500
+    return jsonify({"error": "Internal server error"}), 500
 
 
 def _get_log_files() -> list[Path]:
@@ -377,7 +408,10 @@ def api_history_model(model_name):
 @app.route("/api/trades/<model_name>")
 def api_trades(model_name):
     """Recent trades from journal, falling back to Alpaca order history."""
-    limit = int(flask_request.args.get("limit", 50))
+    try:
+        limit = max(1, min(int(flask_request.args.get("limit", 50)), 1000))
+    except (ValueError, TypeError):
+        limit = 50
     trades = _load_recent_trades(model_name, limit)
 
     # If journal is empty, fetch from Alpaca order history
@@ -645,9 +679,12 @@ def _compute_performance(model_name: str) -> dict:
         "positions": sorted(model_positions, key=lambda x: x["unrealized_plpc"], reverse=True),
     }
 
-    # Cache
+    # Cache (cap at 50 entries to prevent unbounded growth)
     with _perf_cache_lock:
         _perf_cache[model_name] = (result, time.time())
+        if len(_perf_cache) > 50:
+            oldest = min(_perf_cache, key=lambda m: _perf_cache[m][1])
+            del _perf_cache[oldest]
 
     return result
 
@@ -714,6 +751,8 @@ def api_config_models():
 @app.route("/api/config/models", methods=["POST"])
 def api_config_update():
     """Update model slot configuration."""
+    if not _check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
     try:
         data = flask_request.get_json()
         if not data or "slots" not in data:
@@ -749,6 +788,8 @@ def api_config_update():
 @app.route("/api/config/test-key", methods=["POST"])
 def api_config_test_key():
     """Test an Alpaca API key pair."""
+    if not _check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
     try:
         data = flask_request.get_json()
         key = data.get("key", "")
@@ -772,7 +813,9 @@ def api_logs_list():
 
 @app.route("/api/logs/<filename>")
 def api_log_content(filename):
-    log_path = LOG_DIR / filename
+    log_path = (LOG_DIR / filename).resolve()
+    if not str(log_path).startswith(str(LOG_DIR.resolve())):
+        return jsonify({"error": "Not found"}), 404
     if not log_path.exists() or not filename.startswith("pipeline_"):
         return jsonify({"error": "Not found"}), 404
     content = _read_log(log_path, tail=300)
@@ -783,7 +826,11 @@ def api_log_content(filename):
 
 @app.route("/run")
 def trigger_run():
+    if not _check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
     model_filter = flask_request.args.get("model", None)
+    if model_filter and not _validate_model_name(model_filter):
+        return jsonify({"error": "Invalid model name"}), 400
     force = "force" in flask_request.args
     dry = "dry" in flask_request.args
 
@@ -1008,7 +1055,10 @@ def apiv1_trades(model_name):
     """Recent trades for a model."""
     if flask_request.method == "OPTIONS":
         return _cors_response({})
-    limit = int(flask_request.args.get("limit", 50))
+    try:
+        limit = max(1, min(int(flask_request.args.get("limit", 50)), 1000))
+    except (ValueError, TypeError):
+        limit = 50
     trades = _load_recent_trades(model_name, limit)
 
     if not trades:
