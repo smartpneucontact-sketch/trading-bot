@@ -1532,7 +1532,16 @@ def predict_rankings(
         except Exception as e:
             failures.append((sym, str(e)))
 
-    ranked = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
+    # Filter out symbols that Alpaca can't trade (class shares like CWEN-A,
+    # BRK.B, etc. with special characters in the ticker)
+    tradeable_preds = {sym: pred for sym, pred in predictions.items()
+                       if sym.isalpha() and sym.isascii()}
+    skipped = len(predictions) - len(tradeable_preds)
+    if skipped > 0:
+        logger.info(f"  Filtered {skipped} untradeable tickers "
+                    f"(special chars in symbol)")
+
+    ranked = sorted(tradeable_preds.items(), key=lambda x: x[1], reverse=True)
 
     logger.info(f"  Predictions: {len(ranked)} ok, {len(failures)} failed")
     if failures:
@@ -2054,6 +2063,29 @@ def run_single_model(
     logger.info(f"  Using {len(stock_data)} stocks, "
                 f"{len(macro_features.columns)} macro features")
     report.set("stocks_downloaded", len(stock_data))
+
+    # SAFEGUARD: Refuse to run with incomplete data.
+    # Full universe is ~1000 stocks. If we have <500, yfinance download was
+    # partial (e.g. rate-limited) and predictions will be unreliable.
+    MIN_STOCKS_REQUIRED = 500
+    MIN_MACRO_FEATURES = 15  # normally 22
+    if len(stock_data) < MIN_STOCKS_REQUIRED:
+        msg = (f"Insufficient stock data: {len(stock_data)} < {MIN_STOCKS_REQUIRED} required. "
+               f"Download was likely rate-limited. Aborting to avoid bad trades.")
+        logger.error(msg)
+        report.add_error(msg)
+        report.end_step("compute_features")
+        logger.info(report.format_summary())
+        return
+    if len(macro_features.columns) < MIN_MACRO_FEATURES:
+        msg = (f"Insufficient macro data: {len(macro_features.columns)} < {MIN_MACRO_FEATURES} required. "
+               f"Download was likely rate-limited. Aborting to avoid bad trades.")
+        logger.error(msg)
+        report.add_error(msg)
+        report.end_step("compute_features")
+        logger.info(report.format_summary())
+        return
+
     report.end_step("compute_features")
 
     # -- Step 4: Generate predictions --
