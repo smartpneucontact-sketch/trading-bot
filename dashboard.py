@@ -544,29 +544,40 @@ def _compute_performance(model_name: str) -> dict:
         }
 
     # 4) Download SPY benchmark via Alpaca (no yfinance rate limits)
+    # Paper trading keys require feed=iex for market data access
     logger.info(f"[PERF] Computing benchmark for {model_name} from {entry_date}")
+
+    import requests as _requests
+    _alpaca_data_headers = {
+        "APCA-API-KEY-ID": mc.alpaca_key,
+        "APCA-API-SECRET-KEY": mc.alpaca_secret,
+    }
 
     spy_return = None
     try:
-        import requests
-        headers = {
-            "APCA-API-KEY-ID": mc.alpaca_key,
-            "APCA-API-SECRET-KEY": mc.alpaca_secret,
-        }
-        data_url = "https://data.alpaca.markets/v2/stocks/SPY/bars"
-        params = {
-            "start": entry_date,
-            "timeframe": "1Day",
-            "limit": 30,
-            "adjustment": "split",
-        }
-        resp = requests.get(data_url, headers=headers, params=params, timeout=10)
+        resp = _requests.get(
+            "https://data.alpaca.markets/v2/stocks/SPY/bars",
+            headers=_alpaca_data_headers,
+            params={
+                "start": entry_date,
+                "timeframe": "1Day",
+                "limit": 30,
+                "adjustment": "split",
+                "feed": "iex",
+            },
+            timeout=10,
+        )
+        logger.info(f"[PERF] SPY API status={resp.status_code}")
         if resp.status_code == 200:
             bars = resp.json().get("bars", [])
-            if len(bars) >= 2:
+            if bars and len(bars) >= 1:
                 spy_entry = float(bars[0]["o"])  # open on entry date
                 spy_current = float(bars[-1]["c"])  # latest close
-                spy_return = (spy_current / spy_entry - 1) * 100
+                if spy_entry > 0:
+                    spy_return = (spy_current / spy_entry - 1) * 100
+                    logger.info(f"[PERF] SPY: entry={spy_entry}, current={spy_current}, return={spy_return:.2f}%")
+        else:
+            logger.warning(f"[PERF] SPY API error: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         logger.warning(f"[PERF] SPY benchmark failed: {e}")
 
@@ -576,30 +587,35 @@ def _compute_performance(model_name: str) -> dict:
         import random
         sample_size = min(50, len(universe_syms))
         sample_syms = random.sample(universe_syms, sample_size)
+        # Filter out symbols with special chars (Alpaca won't recognize them)
+        sample_syms = [s for s in sample_syms if s.isalpha() and s.isascii()]
         try:
-            import requests
-            headers = {
-                "APCA-API-KEY-ID": mc.alpaca_key,
-                "APCA-API-SECRET-KEY": mc.alpaca_secret,
-            }
-            data_url = "https://data.alpaca.markets/v2/stocks/bars"
-            params = {
-                "symbols": ",".join(sample_syms),
-                "start": entry_date,
-                "timeframe": "1Day",
-                "limit": 30,
-                "adjustment": "split",
-            }
-            resp = requests.get(data_url, headers=headers, params=params, timeout=15)
+            resp = _requests.get(
+                "https://data.alpaca.markets/v2/stocks/bars",
+                headers=_alpaca_data_headers,
+                params={
+                    "symbols": ",".join(sample_syms),
+                    "start": entry_date,
+                    "timeframe": "1Day",
+                    "limit": 30,
+                    "adjustment": "split",
+                    "feed": "iex",
+                },
+                timeout=15,
+            )
+            logger.info(f"[PERF] Universe API status={resp.status_code}")
             if resp.status_code == 200:
                 all_bars = resp.json().get("bars", {})
                 for sym, bars in all_bars.items():
-                    if len(bars) >= 2:
+                    if len(bars) >= 1:
                         entry_price = float(bars[0]["o"])
                         current_price = float(bars[-1]["c"])
                         if entry_price > 0:
                             ret = (current_price / entry_price - 1) * 100
                             universe_returns.append(ret)
+                logger.info(f"[PERF] Universe: {len(universe_returns)}/{len(sample_syms)} stocks returned data")
+            else:
+                logger.warning(f"[PERF] Universe API error: {resp.status_code} {resp.text[:200]}")
         except Exception as e:
             logger.warning(f"[PERF] Universe sample failed: {e}")
 
