@@ -543,64 +543,12 @@ def _compute_performance(model_name: str) -> dict:
             "error": "Could not load universe symbols",
         }
 
-    # 4) Download universe prices from entry_date to now
-    logger.info(f"[PERF] Computing benchmark for {model_name}: "
-                f"{len(universe_syms)} universe symbols from {entry_date}")
-
+    # 4) Download SPY benchmark (fast — single ticker instead of ~1000)
     start_dt = pd.Timestamp(entry_date) - timedelta(days=3)
     end_dt = pd.Timestamp.now() + timedelta(days=1)
 
-    universe_returns = []
-    batch_size = 100
-    for i in range(0, len(universe_syms), batch_size):
-        batch = universe_syms[i:i + batch_size]
-        try:
-            data = yf.download(
-                batch, start=start_dt, end=end_dt,
-                progress=False, threads=True
-            )
-            if data is None or data.empty:
-                continue
+    logger.info(f"[PERF] Computing benchmark for {model_name} from {entry_date}")
 
-            # Handle both MultiIndex and flat column formats from yfinance
-            try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    close = data["Close"]
-                elif "Close" in data.columns:
-                    close = data[["Close"]]
-                    close.columns = batch[:1] if len(batch) == 1 else close.columns
-                else:
-                    continue
-            except (KeyError, TypeError):
-                continue
-
-            if isinstance(close, pd.Series):
-                close = close.to_frame(name=batch[0] if len(batch) == 1 else "Close")
-
-            for sym in batch:
-                try:
-                    if sym in close.columns:
-                        series = close[sym].dropna()
-                    elif len(batch) == 1 and len(close.columns) == 1:
-                        series = close.iloc[:, 0].dropna()
-                    else:
-                        continue
-
-                    after_entry = series[series.index >= pd.Timestamp(entry_date)]
-                    if len(after_entry) < 2:
-                        continue
-
-                    entry_price = float(after_entry.iloc[0])
-                    current_price = float(after_entry.iloc[-1])
-                    if entry_price > 0:
-                        ret = (current_price / entry_price - 1) * 100
-                        universe_returns.append(ret)
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.warning(f"[PERF] Batch download error: {e}")
-
-    # 5) Compute SPY benchmark
     spy_return = None
     try:
         spy_data = yf.download("SPY", start=start_dt, end=end_dt, progress=False)
@@ -617,6 +565,48 @@ def _compute_performance(model_name: str) -> dict:
                 spy_return = float((after_entry.iloc[-1] / after_entry.iloc[0] - 1) * 100)
     except Exception as e:
         logger.warning(f"[PERF] SPY download failed: {e}")
+
+    # 5) Quick universe sample (50 random stocks instead of ~1000 — fast enough)
+    universe_returns = []
+    if universe_syms:
+        import random
+        sample_size = min(50, len(universe_syms))
+        sample_syms = random.sample(universe_syms, sample_size)
+        try:
+            data = yf.download(
+                sample_syms, start=start_dt, end=end_dt,
+                progress=False, threads=True
+            )
+            if data is not None and not data.empty:
+                try:
+                    if isinstance(data.columns, pd.MultiIndex):
+                        close = data["Close"]
+                    elif "Close" in data.columns:
+                        close = data[["Close"]]
+                    else:
+                        close = None
+                except (KeyError, TypeError):
+                    close = None
+
+                if close is not None:
+                    if isinstance(close, pd.Series):
+                        close = close.to_frame(name=sample_syms[0])
+                    for sym in sample_syms:
+                        try:
+                            if sym in close.columns:
+                                series = close[sym].dropna()
+                            elif len(sample_syms) == 1 and len(close.columns) == 1:
+                                series = close.iloc[:, 0].dropna()
+                            else:
+                                continue
+                            after_entry = series[series.index >= pd.Timestamp(entry_date)]
+                            if len(after_entry) >= 2:
+                                ret = float((after_entry.iloc[-1] / after_entry.iloc[0] - 1) * 100)
+                                universe_returns.append(ret)
+                        except Exception:
+                            continue
+        except Exception as e:
+            logger.warning(f"[PERF] Universe sample download error: {e}")
 
     # 6) Build result
     if universe_returns:
@@ -639,7 +629,7 @@ def _compute_performance(model_name: str) -> dict:
         "universe_std": round(universe_std, 2),
         "universe_pct_positive": round(pct_positive, 1),
         "spy_return": round(spy_return, 2) if spy_return is not None else None,
-        "alpha_vs_universe": round(model_return_pct - universe_avg, 2),
+        "alpha_vs_universe": round(model_return_pct - universe_avg, 2) if universe_returns else None,
         "alpha_vs_spy": round(model_return_pct - spy_return, 2) if spy_return is not None else None,
         "positions": sorted(model_positions, key=lambda x: x["unrealized_plpc"], reverse=True),
     }
