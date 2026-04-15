@@ -543,70 +543,65 @@ def _compute_performance(model_name: str) -> dict:
             "error": "Could not load universe symbols",
         }
 
-    # 4) Download SPY benchmark (fast — single ticker instead of ~1000)
-    start_dt = pd.Timestamp(entry_date) - timedelta(days=3)
-    end_dt = pd.Timestamp.now() + timedelta(days=1)
-
+    # 4) Download SPY benchmark via Alpaca (no yfinance rate limits)
     logger.info(f"[PERF] Computing benchmark for {model_name} from {entry_date}")
 
     spy_return = None
     try:
-        spy_data = yf.download("SPY", start=start_dt, end=end_dt, progress=False)
-        if spy_data is not None and not spy_data.empty:
-            if isinstance(spy_data.columns, pd.MultiIndex):
-                spy_close = spy_data["Close"].iloc[:, 0] if isinstance(spy_data["Close"], pd.DataFrame) else spy_data["Close"]
-            else:
-                spy_close = spy_data["Close"]
-            if isinstance(spy_close, pd.DataFrame):
-                spy_close = spy_close.iloc[:, 0]
-            spy_close = spy_close.dropna()
-            after_entry = spy_close[spy_close.index >= pd.Timestamp(entry_date)]
-            if len(after_entry) >= 2:
-                spy_return = float((after_entry.iloc[-1] / after_entry.iloc[0] - 1) * 100)
+        import requests
+        headers = {
+            "APCA-API-KEY-ID": mc.alpaca_key,
+            "APCA-API-SECRET-KEY": mc.alpaca_secret,
+        }
+        data_url = "https://data.alpaca.markets/v2/stocks/SPY/bars"
+        params = {
+            "start": entry_date,
+            "timeframe": "1Day",
+            "limit": 30,
+            "adjustment": "split",
+        }
+        resp = requests.get(data_url, headers=headers, params=params, timeout=10)
+        if resp.status_code == 200:
+            bars = resp.json().get("bars", [])
+            if len(bars) >= 2:
+                spy_entry = float(bars[0]["o"])  # open on entry date
+                spy_current = float(bars[-1]["c"])  # latest close
+                spy_return = (spy_current / spy_entry - 1) * 100
     except Exception as e:
-        logger.warning(f"[PERF] SPY download failed: {e}")
+        logger.warning(f"[PERF] SPY benchmark failed: {e}")
 
-    # 5) Quick universe sample (50 random stocks instead of ~1000 — fast enough)
+    # 5) Quick universe sample via Alpaca (50 random stocks)
     universe_returns = []
     if universe_syms:
         import random
         sample_size = min(50, len(universe_syms))
         sample_syms = random.sample(universe_syms, sample_size)
         try:
-            data = yf.download(
-                sample_syms, start=start_dt, end=end_dt,
-                progress=False, threads=True
-            )
-            if data is not None and not data.empty:
-                try:
-                    if isinstance(data.columns, pd.MultiIndex):
-                        close = data["Close"]
-                    elif "Close" in data.columns:
-                        close = data[["Close"]]
-                    else:
-                        close = None
-                except (KeyError, TypeError):
-                    close = None
-
-                if close is not None:
-                    if isinstance(close, pd.Series):
-                        close = close.to_frame(name=sample_syms[0])
-                    for sym in sample_syms:
-                        try:
-                            if sym in close.columns:
-                                series = close[sym].dropna()
-                            elif len(sample_syms) == 1 and len(close.columns) == 1:
-                                series = close.iloc[:, 0].dropna()
-                            else:
-                                continue
-                            after_entry = series[series.index >= pd.Timestamp(entry_date)]
-                            if len(after_entry) >= 2:
-                                ret = float((after_entry.iloc[-1] / after_entry.iloc[0] - 1) * 100)
-                                universe_returns.append(ret)
-                        except Exception:
-                            continue
+            import requests
+            headers = {
+                "APCA-API-KEY-ID": mc.alpaca_key,
+                "APCA-API-SECRET-KEY": mc.alpaca_secret,
+            }
+            data_url = "https://data.alpaca.markets/v2/stocks/bars"
+            params = {
+                "symbols": ",".join(sample_syms),
+                "start": entry_date,
+                "timeframe": "1Day",
+                "limit": 30,
+                "adjustment": "split",
+            }
+            resp = requests.get(data_url, headers=headers, params=params, timeout=15)
+            if resp.status_code == 200:
+                all_bars = resp.json().get("bars", {})
+                for sym, bars in all_bars.items():
+                    if len(bars) >= 2:
+                        entry_price = float(bars[0]["o"])
+                        current_price = float(bars[-1]["c"])
+                        if entry_price > 0:
+                            ret = (current_price / entry_price - 1) * 100
+                            universe_returns.append(ret)
         except Exception as e:
-            logger.warning(f"[PERF] Universe sample download error: {e}")
+            logger.warning(f"[PERF] Universe sample failed: {e}")
 
     # 6) Build result
     if universe_returns:
