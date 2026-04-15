@@ -807,7 +807,7 @@ def api_config_test_key():
 
 @app.route("/api/logs")
 def api_logs_list():
-    files = _get_log_files()[:20]
+    files = _get_log_files()[:50]
     return jsonify([f.name for f in files])
 
 

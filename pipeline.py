@@ -2503,7 +2503,7 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
     if not models:
         logger.error("No active models found. Set MODEL_V4_ALPACA_KEY/SECRET "
                      "(or ALPACA_API_KEY/SECRET) and ensure model files exist.")
-        sys.exit(1)
+        return
 
     logger.info(f"Active models: {[m.name for m in models]}")
 
@@ -2514,14 +2514,14 @@ def run_pipeline(dry_run: bool = False, force: bool = False,
     symbols = get_tradeable_symbols(logger, report)
     if not symbols:
         logger.error("No symbols found - cannot proceed")
-        sys.exit(1)
+        return
 
     stock_data = download_bars(symbols, LOOKBACK_DAYS, logger, report)
     macro_data = download_macro(LOOKBACK_DAYS, logger, report)
 
     if not stock_data:
         logger.error("No stock data downloaded - cannot proceed")
-        sys.exit(1)
+        return
 
     logger.info("\n[2/2] COMPUTING MACRO FEATURES (shared)")
     macro_features = compute_macro_features(macro_data)
