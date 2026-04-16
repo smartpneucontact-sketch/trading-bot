@@ -197,7 +197,7 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
 
     - Journal entries get updated with Alpaca fill info (status, price, qty).
     - Alpaca orders not in journal (e.g. pre-fix cutloss sells) are backfilled.
-    - Deduplicates by order_id (keeps best version: filled > submitted).
+    - Deduplicates by order_id AND by (symbol, side, shares) within same day.
     - Normalises field names for the dashboard UI (filled_price, notional).
     """
     journal_trades = _load_recent_trades(model_name, limit=500)  # load more for matching
@@ -215,6 +215,20 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
         if "trade_action" in t and "side" not in t:
             t["side"] = t.pop("trade_action")
         return t
+
+    def _trade_day(t):
+        """Extract date portion from timestamp for same-day dedup."""
+        ts = t.get("filled_at") or t.get("timestamp") or ""
+        return ts[:10]  # "2026-04-15T13:38:..." -> "2026-04-15"
+
+    def _dedup_key(t):
+        """Key for deduplicating: same symbol + side + ~shares on same day."""
+        shares = t.get("shares") or 0
+        try:
+            shares = round(float(shares), 1)
+        except (ValueError, TypeError):
+            shares = 0
+        return (_trade_day(t), t.get("symbol", ""), t.get("side", ""), shares)
 
     if not mc:
         return [_normalise(t) for t in journal_trades[:limit]]
@@ -235,9 +249,8 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
     journal_order_ids = set()
 
     # Merge: update journal entries with Alpaca fill data
-    # Deduplicate: if multiple journal entries share the same order_id,
-    # keep only the one with the best status (filled > others).
     seen_order_ids = {}  # order_id -> index in merged list
+    seen_dedup = {}      # dedup_key -> index in merged list (for cross-source dedup)
     merged = []
     for t in journal_trades:
         oid = t.get("order_id")
@@ -259,17 +272,35 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
             if t.get("filled_price") and t.get("shares"):
                 t["notional"] = round(t["shares"] * t["filled_price"], 2)
 
-        # Dedup: skip if we already have a better entry for this order_id
+        # Dedup by order_id: skip if we already have a better entry
         if oid and oid in seen_order_ids:
             existing_idx = seen_order_ids[oid]
             existing = merged[existing_idx]
-            # Keep whichever has "filled" status, or the newer one
             if t.get("order_status") == "filled" and existing.get("order_status") != "filled":
                 merged[existing_idx] = _normalise(t)
             continue
+
+        nt = _normalise(t)
+
+        # Dedup by (symbol, side, shares, day): if a "filled" version from
+        # Alpaca backfill or a matched journal entry already exists, skip
+        # the unmatched "submitted" journal entry.
+        dk = _dedup_key(nt)
+        if dk in seen_dedup:
+            existing_idx = seen_dedup[dk]
+            existing = merged[existing_idx]
+            # Keep whichever has "filled" status
+            if nt.get("order_status") == "filled" and existing.get("order_status") != "filled":
+                merged[existing_idx] = nt
+                if oid:
+                    seen_order_ids[oid] = existing_idx
+            continue
+
+        idx = len(merged)
         if oid:
-            seen_order_ids[oid] = len(merged)
-        merged.append(_normalise(t))
+            seen_order_ids[oid] = idx
+        seen_dedup[dk] = idx
+        merged.append(nt)
 
     # Backfill: add Alpaca orders not in journal (cutloss sells that were
     # never journaled due to the journal.log() bug, plus any other missing orders)
@@ -282,7 +313,7 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
         notional = round(filled_qty * filled_price, 2) if filled_price else 0
         ts = o.get("filled_at") or o.get("submitted_at") or o.get("created_at", "")
         side = o.get("side", "")
-        merged.append({
+        entry = {
             "timestamp": ts,
             "symbol": o.get("symbol", ""),
             "side": side,
@@ -295,7 +326,20 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
             "shares": filled_qty,
             "filled_price": filled_price,
             "source": "alpaca_backfill",
-        })
+        }
+
+        # Dedup against journal entries by (symbol, side, shares, day)
+        dk = _dedup_key(entry)
+        if dk in seen_dedup:
+            existing_idx = seen_dedup[dk]
+            existing = merged[existing_idx]
+            # Alpaca "filled" always wins over journal "submitted"
+            if entry.get("order_status") == "filled" and existing.get("order_status") != "filled":
+                merged[existing_idx] = entry
+            continue
+
+        seen_dedup[dk] = len(merged)
+        merged.append(entry)
 
     # Sort by timestamp descending
     def _ts_key(t):
