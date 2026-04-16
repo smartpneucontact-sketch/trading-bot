@@ -1588,6 +1588,46 @@ def predict_rankings(
 # ALPACA TRADING (with structured trade logging)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _fetch_inactive_assets(symbols: list[str], mc: ModelConfig,
+                           logger) -> set[str]:
+    """Check which symbols are inactive/untradeable on Alpaca.
+
+    Queries Alpaca's asset endpoint for each candidate symbol. Returns a set
+    of symbols that are NOT active or NOT tradeable. We only check the top
+    candidates (2x portfolio size) to keep API calls reasonable.
+    """
+    import requests
+    inactive = set()
+    headers = _make_alpaca_headers(mc)
+    check_count = min(len(symbols), TOP_N * 2)  # check top 40 candidates
+    checked = 0
+    for sym in symbols[:check_count]:
+        try:
+            url = f"{mc.alpaca_base_url}/v2/assets/{sym}"
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                asset = resp.json()
+                if asset.get("status") != "active" or not asset.get("tradable", True):
+                    inactive.add(sym)
+                    logger.info(f"    Filtered {sym}: status={asset.get('status')}, "
+                                f"tradable={asset.get('tradable')}")
+            elif resp.status_code == 404:
+                inactive.add(sym)
+                logger.info(f"    Filtered {sym}: not found on Alpaca")
+            # else: API error, keep the symbol (fail later at order time with proper handling)
+            checked += 1
+        except Exception as e:
+            logger.warning(f"    Asset check failed for {sym}: {e}")
+            # On timeout/error, keep the symbol rather than blocking the pipeline
+            checked += 1
+    if inactive:
+        logger.info(f"  Inactive asset filter: removed {len(inactive)} of {checked} checked "
+                     f"({', '.join(sorted(inactive))})")
+    else:
+        logger.info(f"  Inactive asset filter: all {checked} checked symbols are active")
+    return inactive
+
+
 def _make_alpaca_headers(mc: ModelConfig) -> dict:
     """Build Alpaca auth headers for a specific model's credentials."""
     return {
@@ -2135,6 +2175,14 @@ def run_single_model(
         stock_data, macro_features, model, feature_cols, logger, report,
         feature_version=mc.feature_version,
     )
+
+    # Filter out inactive/untradeable assets (e.g. HOLX after delisting)
+    if not dry_run and mc.alpaca_key:
+        top_symbols = [sym for sym, _ in rankings[:TOP_N * 2]]
+        inactive = _fetch_inactive_assets(top_symbols, mc, logger)
+        if inactive:
+            rankings = [(sym, pred) for sym, pred in rankings if sym not in inactive]
+            report.set("inactive_assets_filtered", sorted(inactive))
 
     if len(rankings) < TOP_N:
         logger.error(f"Only {len(rankings)} predictions - need at least {TOP_N}")
