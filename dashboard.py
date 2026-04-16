@@ -1954,7 +1954,7 @@ def index():
         ['1W','1M','3M','6M','1A','all'].forEach(p => {{
             periodHTML += `<button class="period-btn ${{p===period?'active':''}}" onclick="loadEquityCurve('${{model}}','${{p}}')">${{p}}</button>`;
         }});
-        periodHTML += '</div><div class="card"><h2>Equity Curve</h2><div class="chart-container"><canvas id="chart-${{model}}"></canvas></div></div>';
+        periodHTML += `</div><div class="card"><h2>Equity Curve</h2><div class="chart-container"><canvas id="chart-${{model}}"></canvas></div></div>`;
         container.innerHTML = periodHTML;
 
         const data = await api(`/api/history/${{model}}?period=${{period}}`);
