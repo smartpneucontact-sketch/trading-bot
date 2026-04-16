@@ -179,6 +179,119 @@ def _load_recent_trades(model_name: str, limit: int = 50) -> list:
         return []
 
 
+CUTLOSS_ACTIONS = {"hard_stop", "trailing_stop", "portfolio_stop"}
+
+
+def _load_cutloss_events(model_name: str, limit: int = 100) -> list:
+    """Load cutloss events from the trade journal + cutloss log files.
+
+    Returns a merged list of events from both sources, newest first.
+    Journal entries have full trade details; log entries have the trigger info.
+    """
+    events = []
+
+    # Source 1: Trade journal (has structured data for sells after the fix)
+    journal_path = TRADE_DIR / f"trades_{model_name}.jsonl"
+    if journal_path.exists():
+        try:
+            lines = journal_path.read_text().strip().split("\n")
+            for line in lines:
+                if line.strip():
+                    trade = json.loads(line)
+                    if trade.get("action") in CUTLOSS_ACTIONS:
+                        events.append({
+                            "timestamp": trade.get("timestamp", ""),
+                            "symbol": trade.get("symbol", ""),
+                            "trigger": trade.get("action", ""),
+                            "side": trade.get("side", "sell"),
+                            "shares": trade.get("shares"),
+                            "order_status": trade.get("order_status", ""),
+                            "order_id": trade.get("order_id"),
+                            "error_message": trade.get("error_message"),
+                            "source": "journal",
+                        })
+        except Exception:
+            pass
+
+    # Source 2: Cutloss log files (has trigger details, pct from peak/entry)
+    try:
+        log_files = sorted(LOG_DIR.glob("cutloss_*.log"), reverse=True)[:30]
+        for log_file in log_files:
+            for raw_line in log_file.read_text().strip().split("\n"):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                # Match cutloss trigger lines like:
+                #   [CUTLOSS] v7: HARD STOP on IPGP! -8.23% from entry ...
+                #   [CUTLOSS] v7: TRAILING STOP on TEAM! -5.12% from peak ...
+                #   [CUTLOSS] v7: SELLING IPGP qty=57.56 reason=hard_stop (-8.23%)
+                #   [CUTLOSS] v7: PORTFOLIO STOP triggered! ...
+                if f"[CUTLOSS] {model_name}:" not in line:
+                    continue
+                # Extract timestamp from log line prefix (YYYY-MM-DD HH:MM:SS)
+                ts = line[:19] if len(line) >= 19 else ""
+                if "HARD STOP on" in line or "TRAILING STOP on" in line:
+                    # Parse: [CUTLOSS] v7: TRAILING STOP on TEAM! -5.12% from peak $72.50
+                    parts = line.split("STOP on ")
+                    if len(parts) >= 2:
+                        rest = parts[1]  # "TEAM! -5.12% from peak $72.50 ..."
+                        sym = rest.split("!")[0].strip()
+                        trigger = "trailing_stop" if "TRAILING" in line else "hard_stop"
+                        pct_str = rest.split("!")[1].strip() if "!" in rest else ""
+                        # Deduplicate: skip if we already have a journal entry for same model+symbol+timestamp
+                        already_in = any(
+                            e["symbol"] == sym and e["source"] == "journal"
+                            and e["timestamp"][:16] == ts[:16]
+                            for e in events
+                        )
+                        if not already_in:
+                            events.append({
+                                "timestamp": ts,
+                                "symbol": sym,
+                                "trigger": trigger,
+                                "detail": pct_str,
+                                "side": "sell",
+                                "source": "log",
+                            })
+                elif "PORTFOLIO STOP triggered" in line:
+                    events.append({
+                        "timestamp": ts,
+                        "symbol": "*ALL*",
+                        "trigger": "portfolio_stop",
+                        "detail": line.split("triggered!")[1].strip() if "triggered!" in line else "",
+                        "side": "sell",
+                        "source": "log",
+                    })
+                elif "SELLING" in line and "reason=" in line:
+                    # Parse: [CUTLOSS] v7: SELLING IPGP qty=57.56 reason=hard_stop (-8.23%)
+                    try:
+                        after_selling = line.split("SELLING ")[1]
+                        sym = after_selling.split()[0]
+                        reason = ""
+                        if "reason=" in after_selling:
+                            reason = after_selling.split("reason=")[1].split()[0]
+                        already_in = any(
+                            e["symbol"] == sym and e["timestamp"][:16] == ts[:16]
+                            for e in events
+                        )
+                        if not already_in:
+                            events.append({
+                                "timestamp": ts,
+                                "symbol": sym,
+                                "trigger": reason,
+                                "side": "sell",
+                                "source": "log",
+                            })
+                    except (IndexError, ValueError):
+                        pass
+    except Exception:
+        pass
+
+    # Sort newest first, deduplicate, limit
+    events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+    return events[:limit]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PIPELINE RUNNER
 # ═══════════════════════════════════════════════════════════════════════════
@@ -448,6 +561,17 @@ def api_trades(model_name):
                 trades = alpaca_trades[:limit]
 
     return jsonify(trades)
+
+
+@app.route("/api/cutloss/<model_name>")
+def api_cutloss(model_name):
+    """Cutloss events for a model from journal + log files."""
+    try:
+        limit = max(1, min(int(flask_request.args.get("limit", 100)), 500))
+    except (ValueError, TypeError):
+        limit = 100
+    events = _load_cutloss_events(model_name, limit)
+    return jsonify(events)
 
 
 @app.route("/api/portfolio/<model_name>")
@@ -1096,6 +1220,23 @@ def apiv1_trades(model_name):
     })
 
 
+@app.route("/api/v1/cutloss/<model_name>", methods=["GET", "OPTIONS"])
+def apiv1_cutloss(model_name):
+    """Cutloss events for a model."""
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    try:
+        limit = max(1, min(int(flask_request.args.get("limit", 100)), 500))
+    except (ValueError, TypeError):
+        limit = 100
+    events = _load_cutloss_events(model_name, limit)
+    return _cors_response({
+        "model": model_name,
+        "count": len(events),
+        "events": events,
+    })
+
+
 @app.route("/api/v1/account/<model_name>", methods=["GET", "OPTIONS"])
 def apiv1_account(model_name):
     """Live Alpaca account info for a model."""
@@ -1486,6 +1627,7 @@ def index():
                     <button class="sub-tab" onclick="switchSub('${{m}}','chart',this)">Equity Curve</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','performance',this)">Performance</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','trades',this)">Trades</button>
+                    <button class="sub-tab" onclick="switchSub('${{m}}','cutloss',this)">Cut-Loss</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','history',this)">Run History</button>
                     <button class="sub-tab" onclick="switchSub('${{m}}','about',this)">About</button>
                 </div>
@@ -1494,6 +1636,7 @@ def index():
                 <div id="sub-chart-${{m}}" class="sub-content"></div>
                 <div id="sub-performance-${{m}}" class="sub-content"></div>
                 <div id="sub-trades-${{m}}" class="sub-content"></div>
+                <div id="sub-cutloss-${{m}}" class="sub-content"></div>
                 <div id="sub-history-${{m}}" class="sub-content"></div>
                 <div id="sub-about-${{m}}" class="sub-content"></div>
                 <div class="actions" style="margin-top:14px">
@@ -1814,6 +1957,44 @@ def index():
         $(`sub-trades-${{model}}`).innerHTML = html;
     }}
 
+    async function loadCutloss(model) {{
+        const events = await api(`/api/cutloss/${{model}}`);
+        let html = '<div class="card"><h2>&#9888; Cut-Loss Events</h2>';
+
+        if (events && events.length > 0) {{
+            html += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">
+                Showing ${{events.length}} cutloss event(s). Triggers: hard stop (-8% from entry),
+                trailing stop (-5% from peak), portfolio stop (-3% daily drawdown).
+            </p>`;
+            html += `<table>
+                <tr><th>Time</th><th>Symbol</th><th>Trigger</th><th>Detail</th>
+                    <th>Shares</th><th>Status</th><th>Source</th></tr>`;
+            events.forEach(e => {{
+                const ts = e.timestamp || '';
+                const displayTs = ts.length > 16 ? ts.slice(0,10) + ' ' + ts.slice(11,16) : ts.slice(0,16);
+                const triggerLabel = (e.trigger || '').replace('_', ' ').toUpperCase();
+                const triggerCls = e.trigger === 'portfolio_stop' ? 'red' :
+                                   e.trigger === 'hard_stop' ? 'red' : 'yellow';
+                const statusCls = (e.order_status === 'rejected' || e.order_status === 'canceled') ? 'red' : '';
+                html += `<tr>
+                    <td class="mono" style="font-size:11px">${{displayTs}}</td>
+                    <td><strong>${{e.symbol || '-'}}</strong></td>
+                    <td><span class="badge badge-${{triggerCls}}" style="font-size:10px">${{triggerLabel}}</span></td>
+                    <td class="mono" style="font-size:11px">${{e.detail || '-'}}</td>
+                    <td class="text-right mono">${{e.shares ? fmtN(e.shares, 2) : '-'}}</td>
+                    <td class="${{statusCls}}">${{e.order_status || '-'}}</td>
+                    <td style="font-size:10px;color:var(--text-dim)">${{e.source || '-'}}</td>
+                </tr>`;
+            }});
+            html += '</table>';
+        }} else {{
+            html += '<p style="color:var(--text-dim)">No cutloss events recorded yet.</p>';
+            html += '<p style="font-size:12px;color:var(--text-dim)">Events will appear here when the cut-loss scanner triggers a sell during market hours.</p>';
+        }}
+        html += '</div>';
+        $(`sub-cutloss-${{model}}`).innerHTML = html;
+    }}
+
     async function loadRunHistory(model) {{
         const state = await api(`/api/status`);
         const modelData = state && state.models ? state.models[model] : null;
@@ -2070,6 +2251,7 @@ def index():
                 else if (sub === 'chart') await loadEquityCurve(activeModel);
                 else if (sub === 'performance') await loadPerformance(activeModel);
                 else if (sub === 'trades') await loadTrades(activeModel);
+                else if (sub === 'cutloss') await loadCutloss(activeModel);
                 else if (sub === 'history') await loadRunHistory(activeModel);
                 else if (sub === 'about') await loadAbout(activeModel);
             }}

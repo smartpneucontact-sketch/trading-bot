@@ -2337,6 +2337,48 @@ def _is_market_open() -> bool:
     return market_open <= now <= market_close
 
 
+def _get_cutloss_logger():
+    """Get or create a cutloss logger with file handler.
+
+    Uses a single rotating log file (cutloss_YYYYMMDD.log) per day so that
+    cutloss events are visible via the /api/logs endpoint.
+    """
+    logger = logging.getLogger("cutloss")
+    if not logger.handlers:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        # Daily log file — accessible via dashboard log viewer
+        log_file = LOG_DIR / f"cutloss_{datetime.now().strftime('%Y%m%d')}.log"
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(fmt)
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+        logger.setLevel(logging.INFO)
+    else:
+        # Rotate file handler if the day changed
+        today_suffix = datetime.now().strftime('%Y%m%d')
+        for h in logger.handlers:
+            if isinstance(h, logging.FileHandler):
+                if today_suffix not in str(h.baseFilename):
+                    logger.removeHandler(h)
+                    h.close()
+                    log_file = LOG_DIR / f"cutloss_{today_suffix}.log"
+                    fmt = logging.Formatter(
+                        "%(asctime)s [%(levelname)s] %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S",
+                    )
+                    new_fh = logging.FileHandler(log_file)
+                    new_fh.setFormatter(fmt)
+                    logger.addHandler(new_fh)
+                break
+    return logger
+
+
 def cutloss_scan():
     """Scan all cutloss-enabled models and execute stops if triggered.
 
@@ -2349,7 +2391,7 @@ def cutloss_scan():
     if not _is_market_open():
         return
 
-    logger = logging.getLogger("cutloss")
+    logger = _get_cutloss_logger()
 
     models = get_active_models()
     cutloss_models = [mc for mc in models if mc.enable_cutloss]
