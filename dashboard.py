@@ -179,6 +179,101 @@ def _load_recent_trades(model_name: str, limit: int = 50) -> list:
         return []
 
 
+def _fetch_alpaca_orders(mc, limit: int = 200) -> list:
+    """Fetch recent orders from Alpaca API, cached for 60s."""
+    def _fetch():
+        logger = logging.getLogger("dashboard")
+        orders = pipeline.alpaca_request(
+            "GET",
+            f"v2/orders?status=all&limit={limit}&direction=desc",
+            mc, logger=logger
+        )
+        return orders if isinstance(orders, list) else []
+    return _cached_api_call(f"orders_all_{mc.name}", _fetch, ttl=60) or []
+
+
+def _load_trades_merged(model_name: str, limit: int = 50) -> list:
+    """Load trades merged from journal + Alpaca order history.
+
+    - Journal entries get updated with Alpaca fill info (status, price, qty).
+    - Alpaca orders not in journal (e.g. pre-fix cutloss sells) are backfilled.
+    """
+    journal_trades = _load_recent_trades(model_name, limit=500)  # load more for matching
+    mc = _get_model_config(model_name)
+    if not mc:
+        return journal_trades[:limit]
+
+    # Fetch Alpaca order history
+    alpaca_orders = _fetch_alpaca_orders(mc, limit=200)
+    if not alpaca_orders:
+        return journal_trades[:limit]
+
+    # Index Alpaca orders by order_id for fast lookup
+    alpaca_by_id = {}
+    for o in alpaca_orders:
+        oid = o.get("id")
+        if oid:
+            alpaca_by_id[oid] = o
+
+    # Track which Alpaca order_ids are covered by journal entries
+    journal_order_ids = set()
+
+    # Merge: update journal entries with Alpaca fill data
+    merged = []
+    for t in journal_trades:
+        oid = t.get("order_id")
+        if oid and oid in alpaca_by_id:
+            journal_order_ids.add(oid)
+            ao = alpaca_by_id[oid]
+            # Update status, fill price, filled qty from Alpaca
+            t["order_status"] = ao.get("status", t.get("order_status", ""))
+            fq = ao.get("filled_qty")
+            fp = ao.get("filled_avg_price")
+            if fq and float(fq or 0) > 0:
+                t["shares"] = float(fq)
+            if fp and float(fp or 0) > 0:
+                t["fill_price"] = float(fp)
+            filled_at = ao.get("filled_at")
+            if filled_at:
+                t["filled_at"] = filled_at
+        merged.append(t)
+
+    # Backfill: add Alpaca orders not in journal (cutloss sells that were
+    # never journaled due to the journal.log() bug)
+    for o in alpaca_orders:
+        oid = o.get("id")
+        if oid in journal_order_ids:
+            continue
+        # Only backfill sell orders (cutloss sells are always sell-side)
+        if o.get("side") != "sell":
+            continue
+        filled_qty = float(o.get("filled_qty", 0) or 0)
+        filled_price = float(o.get("filled_avg_price", 0) or 0)
+        notional = round(filled_qty * filled_price, 2) if filled_price else 0
+        ts = o.get("filled_at") or o.get("submitted_at") or o.get("created_at", "")
+        merged.append({
+            "timestamp": ts,
+            "symbol": o.get("symbol", ""),
+            "side": "sell",
+            "action": "cutloss_backfill",
+            "order_type": o.get("type", "market"),
+            "time_in_force": o.get("time_in_force", ""),
+            "notional_usd": notional,
+            "order_status": o.get("status", ""),
+            "order_id": oid,
+            "shares": filled_qty,
+            "fill_price": filled_price,
+            "source": "alpaca_backfill",
+        })
+
+    # Sort by timestamp descending
+    def _ts_key(t):
+        return t.get("filled_at") or t.get("timestamp") or ""
+    merged.sort(key=_ts_key, reverse=True)
+
+    return merged[:limit]
+
+
 CUTLOSS_ACTIONS = {"hard_stop", "trailing_stop", "portfolio_stop"}
 
 
@@ -520,46 +615,12 @@ def api_history_model(model_name):
 
 @app.route("/api/trades/<model_name>")
 def api_trades(model_name):
-    """Recent trades from journal, falling back to Alpaca order history."""
+    """Recent trades from journal merged with Alpaca order history."""
     try:
         limit = max(1, min(int(flask_request.args.get("limit", 50)), 1000))
     except (ValueError, TypeError):
         limit = 50
-    trades = _load_recent_trades(model_name, limit)
-
-    # If journal is empty, fetch from Alpaca order history
-    if not trades:
-        mc = _get_model_config(model_name)
-        if mc:
-            def fetch_orders():
-                logger = logging.getLogger("dashboard")
-                orders = pipeline.alpaca_request(
-                    "GET",
-                    "v2/orders?status=all&limit=100&direction=desc",
-                    mc, logger=logger
-                )
-                result = []
-                for o in orders:
-                    filled_qty = float(o.get("filled_qty", 0) or 0)
-                    filled_price = float(o.get("filled_avg_price", 0) or 0)
-                    notional = filled_qty * filled_price if filled_price else float(o.get("notional", 0) or 0)
-                    result.append({
-                        "timestamp": o.get("filled_at") or o.get("submitted_at") or o.get("created_at", ""),
-                        "symbol": o.get("symbol", ""),
-                        "trade_action": o.get("side", ""),
-                        "notional": round(notional, 2),
-                        "order_status": o.get("status", ""),
-                        "shares": filled_qty,
-                        "filled_price": filled_price,
-                        "order_type": o.get("type", ""),
-                        "error_message": "",
-                        "source": "alpaca",
-                    })
-                return result
-            alpaca_trades = _cached_api_call(f"orders_{model_name}", fetch_orders, ttl=60)
-            if alpaca_trades:
-                trades = alpaca_trades[:limit]
-
+    trades = _load_trades_merged(model_name, limit)
     return jsonify(trades)
 
 
@@ -1183,35 +1244,7 @@ def apiv1_trades(model_name):
         limit = max(1, min(int(flask_request.args.get("limit", 50)), 1000))
     except (ValueError, TypeError):
         limit = 50
-    trades = _load_recent_trades(model_name, limit)
-
-    if not trades:
-        mc = _get_model_config(model_name)
-        if mc:
-            try:
-                logger = logging.getLogger("dashboard")
-                orders = pipeline.alpaca_request(
-                    "GET", "v2/orders?status=all&limit=100&direction=desc",
-                    mc, logger=logger
-                )
-                trades = []
-                for o in orders:
-                    filled_qty = float(o.get("filled_qty", 0) or 0)
-                    filled_price = float(o.get("filled_avg_price", 0) or 0)
-                    notional = round(filled_qty * filled_price, 2) if filled_price else 0
-                    trades.append({
-                        "timestamp": o.get("filled_at") or o.get("submitted_at") or o.get("created_at", ""),
-                        "symbol": o.get("symbol", ""),
-                        "side": o.get("side", ""),
-                        "qty": filled_qty,
-                        "price": filled_price,
-                        "notional": notional,
-                        "status": o.get("status", ""),
-                        "order_type": o.get("type", ""),
-                    })
-                trades = trades[:limit]
-            except Exception:
-                trades = []
+    trades = _load_trades_merged(model_name, limit)
 
     return _cors_response({
         "model": model_name,

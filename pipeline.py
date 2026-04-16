@@ -1628,6 +1628,34 @@ def _fetch_inactive_assets(symbols: list[str], mc: ModelConfig,
     return inactive
 
 
+def _poll_order_status(order_id: str, mc: ModelConfig, logger,
+                       max_wait: float = 3.0, interval: float = 0.5) -> dict:
+    """Poll Alpaca for final order status (filled/rejected/etc).
+
+    Market orders usually fill within 1-2 seconds during market hours.
+    Returns the order dict with final status, filled_qty, filled_avg_price.
+    """
+    import time as _time
+    terminal_states = {"filled", "canceled", "expired", "rejected",
+                       "suspended", "replaced"}
+    elapsed = 0.0
+    while elapsed < max_wait:
+        try:
+            order = alpaca_request("GET", f"v2/orders/{order_id}", mc)
+            status = order.get("status", "")
+            if status in terminal_states:
+                return order
+        except Exception:
+            break
+        _time.sleep(interval)
+        elapsed += interval
+    # Return whatever we have (may still be pending)
+    try:
+        return alpaca_request("GET", f"v2/orders/{order_id}", mc)
+    except Exception:
+        return {"status": "unknown", "id": order_id}
+
+
 def _make_alpaca_headers(mc: ModelConfig) -> dict:
     """Build Alpaca auth headers for a specific model's credentials."""
     return {
@@ -1992,6 +2020,20 @@ def rebalance_portfolio(
             logger.error(f"    FAIL {order['trade_action'].upper():16s} {sym:6s}: {e}")
             report.add_error(f"Order failed: {order['trade_action']} {sym} - {e}")
             failed += 1
+
+        # Poll for final order status (fills, price, qty)
+        if trade.order_id and trade.order_status not in ("failed", "rejected", "canceled", "expired"):
+            try:
+                final = _poll_order_status(trade.order_id, mc, logger)
+                trade.order_status = final.get("status", trade.order_status)
+                filled_qty = final.get("filled_qty")
+                filled_price = final.get("filled_avg_price")
+                if filled_qty and filled_qty != "0":
+                    trade.shares = float(filled_qty)
+                if filled_price and filled_price != "0":
+                    trade.fill_price = float(filled_price)
+            except Exception:
+                pass  # keep whatever status we already have
 
         # Log trade to journal regardless of success/failure
         journal.log_trade(trade)
@@ -2531,6 +2573,24 @@ def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
         else:
             logger.info(f"[CUTLOSS] {mc.name}: {symbol} sell order placed: {order_id}, status={order_status}")
 
+        # Poll for final order status before journaling
+        fill_price = None
+        filled_qty = qty
+        if order_id and order_id != "?" and order_status not in ("rejected", "canceled", "expired"):
+            try:
+                final = _poll_order_status(order_id, mc, logger)
+                order_status = final.get("status", order_status)
+                fq = final.get("filled_qty")
+                fp = final.get("filled_avg_price")
+                if fq and fq != "0":
+                    filled_qty = float(fq)
+                if fp and fp != "0":
+                    fill_price = float(fp)
+                logger.info(f"[CUTLOSS] {mc.name}: {symbol} final status={order_status}, "
+                            f"filled_qty={filled_qty}, fill_price={fill_price}")
+            except Exception:
+                pass
+
         # Log to trade journal
         journal = TradeJournal(mc.name)
         record = TradeRecord(
@@ -2547,9 +2607,10 @@ def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
             order_status=order_status,
             order_id=order_id,
             error_message=result.get("reject_reason") if order_status in ("rejected", "canceled", "expired") else None,
-            shares=qty,
+            shares=filled_qty,
+            fill_price=fill_price,
         )
-        journal.log(record)
+        journal.log_trade(record)
 
         # Clear peak tracking for this symbol (only if order was accepted)
         if order_status not in ("rejected", "canceled", "expired"):
