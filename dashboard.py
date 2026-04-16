@@ -197,16 +197,32 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
 
     - Journal entries get updated with Alpaca fill info (status, price, qty).
     - Alpaca orders not in journal (e.g. pre-fix cutloss sells) are backfilled.
+    - Deduplicates by order_id (keeps best version: filled > submitted).
+    - Normalises field names for the dashboard UI (filled_price, notional).
     """
     journal_trades = _load_recent_trades(model_name, limit=500)  # load more for matching
     mc = _get_model_config(model_name)
+
+    # Normalise field names on journal entries for the dashboard UI
+    def _normalise(t):
+        # filled_price: UI reads t.filled_price
+        if "fill_price" in t and "filled_price" not in t:
+            t["filled_price"] = t.pop("fill_price")
+        # notional: UI reads t.notional
+        if "notional_usd" in t and "notional" not in t:
+            t["notional"] = t.pop("notional_usd")
+        # side: some old entries use trade_action instead of side
+        if "trade_action" in t and "side" not in t:
+            t["side"] = t.pop("trade_action")
+        return t
+
     if not mc:
-        return journal_trades[:limit]
+        return [_normalise(t) for t in journal_trades[:limit]]
 
     # Fetch Alpaca order history
     alpaca_orders = _fetch_alpaca_orders(mc, limit=200)
     if not alpaca_orders:
-        return journal_trades[:limit]
+        return [_normalise(t) for t in journal_trades[:limit]]
 
     # Index Alpaca orders by order_id for fast lookup
     alpaca_by_id = {}
@@ -219,6 +235,9 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
     journal_order_ids = set()
 
     # Merge: update journal entries with Alpaca fill data
+    # Deduplicate: if multiple journal entries share the same order_id,
+    # keep only the one with the best status (filled > others).
+    seen_order_ids = {}  # order_id -> index in merged list
     merged = []
     for t in journal_trades:
         oid = t.get("order_id")
@@ -232,37 +251,49 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
             if fq and float(fq or 0) > 0:
                 t["shares"] = float(fq)
             if fp and float(fp or 0) > 0:
-                t["fill_price"] = float(fp)
+                t["filled_price"] = float(fp)
             filled_at = ao.get("filled_at")
             if filled_at:
                 t["filled_at"] = filled_at
-        merged.append(t)
+            # Compute notional from fill data
+            if t.get("filled_price") and t.get("shares"):
+                t["notional"] = round(t["shares"] * t["filled_price"], 2)
+
+        # Dedup: skip if we already have a better entry for this order_id
+        if oid and oid in seen_order_ids:
+            existing_idx = seen_order_ids[oid]
+            existing = merged[existing_idx]
+            # Keep whichever has "filled" status, or the newer one
+            if t.get("order_status") == "filled" and existing.get("order_status") != "filled":
+                merged[existing_idx] = _normalise(t)
+            continue
+        if oid:
+            seen_order_ids[oid] = len(merged)
+        merged.append(_normalise(t))
 
     # Backfill: add Alpaca orders not in journal (cutloss sells that were
-    # never journaled due to the journal.log() bug)
+    # never journaled due to the journal.log() bug, plus any other missing orders)
     for o in alpaca_orders:
         oid = o.get("id")
         if oid in journal_order_ids:
-            continue
-        # Only backfill sell orders (cutloss sells are always sell-side)
-        if o.get("side") != "sell":
             continue
         filled_qty = float(o.get("filled_qty", 0) or 0)
         filled_price = float(o.get("filled_avg_price", 0) or 0)
         notional = round(filled_qty * filled_price, 2) if filled_price else 0
         ts = o.get("filled_at") or o.get("submitted_at") or o.get("created_at", "")
+        side = o.get("side", "")
         merged.append({
             "timestamp": ts,
             "symbol": o.get("symbol", ""),
-            "side": "sell",
-            "action": "cutloss_backfill",
+            "side": side,
+            "action": "cutloss_backfill" if side == "sell" else "backfill",
             "order_type": o.get("type", "market"),
             "time_in_force": o.get("time_in_force", ""),
-            "notional_usd": notional,
+            "notional": notional,
             "order_status": o.get("status", ""),
             "order_id": oid,
             "shares": filled_qty,
-            "fill_price": filled_price,
+            "filled_price": filled_price,
             "source": "alpaca_backfill",
         })
 
