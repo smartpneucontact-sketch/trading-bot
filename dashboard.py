@@ -234,7 +234,7 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
         return [_normalise(t) for t in journal_trades[:limit]]
 
     # Fetch Alpaca order history
-    alpaca_orders = _fetch_alpaca_orders(mc, limit=200)
+    alpaca_orders = _fetch_alpaca_orders(mc, limit=500)
     if not alpaca_orders:
         return [_normalise(t) for t in journal_trades[:limit]]
 
@@ -340,6 +340,26 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
 
         seen_dedup[dk] = len(merged)
         merged.append(entry)
+
+    # Clean up stale entries: if a journal entry still shows "pending_new" or
+    # "submitted" and it's older than 1 hour, the status is stale (orders
+    # resolve in seconds). Mark them so the UI shows the right info.
+    from datetime import datetime, timezone, timedelta
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    stale_statuses = {"pending_new", "submitted", "accepted", "new"}
+    for t in merged:
+        if t.get("order_status") in stale_statuses:
+            ts_str = t.get("filled_at") or t.get("timestamp") or ""
+            try:
+                # Parse ISO timestamp (handles both Z and +00:00 suffix)
+                ts_clean = ts_str.replace("Z", "+00:00")
+                if "+" not in ts_clean and ts_clean:
+                    ts_clean += "+00:00"
+                entry_time = datetime.fromisoformat(ts_clean)
+                if entry_time < stale_cutoff:
+                    t["order_status"] = "filled*"
+            except (ValueError, TypeError):
+                pass
 
     # Sort by timestamp descending
     def _ts_key(t):
