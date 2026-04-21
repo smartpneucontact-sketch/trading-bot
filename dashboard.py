@@ -1663,6 +1663,7 @@ def index():
     <div class="header">
         <div>
             <h1>ML Trading Bot</h1>
+            <p style="margin:-10px 0 10px 0;color:var(--text-dim);font-size:13px;">by Arsen Khanguieldyan</p>
             <div class="meta">H{pipeline.HORIZON}_LongOnly{pipeline.TOP_N} &middot; Paper Trading &middot;
                 <span id="status-badge"></span> &middot; Auto-refresh 15s</div>
         </div>
