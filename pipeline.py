@@ -2467,6 +2467,9 @@ def _cutloss_scan_model(mc: ModelConfig, logger):
     if not positions:
         return
 
+    n_positions = len(positions)
+    total_market_value = sum(float(p.get("market_value", 0)) for p in positions)
+
     # Fetch account for portfolio-level stop
     try:
         acct = alpaca_request("GET", "v2/account", mc, logger=logger)
@@ -2495,9 +2498,13 @@ def _cutloss_scan_model(mc: ModelConfig, logger):
             logger.warning(
                 f"[CUTLOSS] {mc.name}: PORTFOLIO STOP triggered! "
                 f"Daily drawdown: {daily_drawdown_pct:.2f}% <= {mc.cutloss_portfolio_stop}%. "
-                f"Liquidating ALL positions."
+                f"Liquidating ALL {n_positions} positions (equity=${current_equity:,.2f})."
             )
             _liquidate_all(mc, positions, "portfolio_stop", logger)
+            logger.warning(
+                f"[CUTLOSS] {mc.name}: SUMMARY — liquidated all {n_positions} positions, "
+                f"0/{n_positions} remaining, equity=${current_equity:,.2f}"
+            )
             return
 
     # ── Per-position stop checks ─────────────────────────────
@@ -2549,8 +2556,16 @@ def _cutloss_scan_model(mc: ModelConfig, logger):
         except Exception as e:
             logger.error(f"[CUTLOSS] {mc.name}: failed to sell {sym}: {e}")
 
-    # Redistribute freed cash into remaining positions (hard/trailing stops only)
+    # Summary after sells
     if sold_symbols:
+        remaining = n_positions - len(sold_symbols)
+        logger.info(
+            f"[CUTLOSS] {mc.name}: SUMMARY — sold {len(sold_symbols)} "
+            f"({', '.join(sold_symbols)}), {remaining}/{n_positions} positions remaining, "
+            f"equity=${current_equity:,.2f}"
+        )
+
+        # Redistribute freed cash into remaining positions (hard/trailing stops only)
         try:
             _redistribute_after_cutloss(mc, sold_symbols, logger)
         except Exception as e:
