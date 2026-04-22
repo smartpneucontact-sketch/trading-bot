@@ -2574,11 +2574,13 @@ def _cutloss_scan_model(mc: ModelConfig, logger):
 
 def _redistribute_after_cutloss(mc: ModelConfig, sold_symbols: list[str],
                                  logger):
-    """Redistribute cash from cutloss sells proportionally into remaining positions.
+    """Replace sold positions with next-best stocks from the model's latest predictions.
 
-    After a hard/trailing stop sells a position, the freed cash is distributed
-    across remaining positions proportional to their current market value.
-    This keeps the portfolio fully invested without needing a full rebalance.
+    After a hard/trailing stop sells a position:
+    1. Look up the model's last predictions from state
+    2. Pick replacement stocks (ranked candidates not currently held)
+    3. Buy replacements with equal share of freed cash
+    4. Distribute any leftover proportionally across remaining positions
     """
     import time as _time
     # Wait briefly for sells to settle
@@ -2592,10 +2594,6 @@ def _redistribute_after_cutloss(mc: ModelConfig, sold_symbols: list[str],
         logger.error(f"[REDISTRIBUTE] {mc.name}: failed to fetch positions/account: {e}")
         return
 
-    if not positions:
-        logger.info(f"[REDISTRIBUTE] {mc.name}: no remaining positions, skipping redistribution")
-        return
-
     # Calculate available cash to redistribute
     cash = float(account.get("cash", 0))
     buying_power = float(account.get("buying_power", 0))
@@ -2606,95 +2604,170 @@ def _redistribute_after_cutloss(mc: ModelConfig, sold_symbols: list[str],
     buffer = equity * 0.01
     available = max(0, available - buffer)
 
-    if available < 50:  # less than $50 not worth redistributing
+    if available < 50:
         logger.info(f"[REDISTRIBUTE] {mc.name}: only ${available:.2f} available, skipping")
         return
 
-    # Calculate proportional allocation based on current market value
-    remaining = []
-    total_market_value = 0
+    # Current held symbols (after sells)
+    held_symbols = set()
     for p in positions:
         sym = p["symbol"]
-        if sym in sold_symbols:
-            continue  # skip if sell hasn't settled yet
-        mv = float(p.get("market_value", 0))
-        if mv > 0:
-            remaining.append({"symbol": sym, "market_value": mv})
-            total_market_value += mv
+        if sym not in sold_symbols:
+            held_symbols.add(sym)
 
-    if not remaining or total_market_value <= 0:
-        logger.info(f"[REDISTRIBUTE] {mc.name}: no valid positions to redistribute into")
-        return
+    n_held = len(held_symbols)
+    n_to_replace = len(sold_symbols)
 
-    logger.info(f"[REDISTRIBUTE] {mc.name}: distributing ${available:.2f} across "
-                f"{len(remaining)} positions (sold: {', '.join(sold_symbols)})")
+    # Load last predictions from model state to find replacement candidates
+    state = load_state(mc)
+    history = state.get("history", [])
+    replacements = []
 
-    # Place proportional buy orders
+    if history:
+        latest = history[-1]
+        predictions = latest.get("predictions", {})
+        # predictions is {symbol: score}, sorted by score descending
+        ranked = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
+
+        # Also check a wider set: target_symbols from last rebalance
+        target_syms = set(latest.get("target_symbols", []))
+
+        # Find candidates: in predictions, not currently held, not just sold
+        sold_set = set(sold_symbols)
+        for sym, score in ranked:
+            if sym in held_symbols or sym in sold_set:
+                continue
+            replacements.append((sym, score))
+            if len(replacements) >= n_to_replace:
+                break
+
+        # If not enough from top predictions, look beyond TOP_N in target_symbols
+        if len(replacements) < n_to_replace:
+            for sym in target_syms:
+                if sym in held_symbols or sym in sold_set:
+                    continue
+                if sym not in [r[0] for r in replacements]:
+                    replacements.append((sym, 0))
+                    if len(replacements) >= n_to_replace:
+                        break
+
+    if replacements:
+        logger.info(f"[REDISTRIBUTE] {mc.name}: replacing {n_to_replace} sold position(s) "
+                    f"with {len(replacements)} new: {', '.join(r[0] for r in replacements)}")
+    else:
+        logger.info(f"[REDISTRIBUTE] {mc.name}: no replacement candidates found in predictions, "
+                    f"distributing into {n_held} existing positions")
+
+    # Allocate cash: equal-weight for replacements, remainder spread across existing
     journal = TradeJournal(mc.name)
     n_bought = 0
-    for pos in remaining:
-        sym = pos["symbol"]
-        weight = pos["market_value"] / total_market_value
-        alloc = round(available * weight, 2)
-        if alloc < 5:  # skip tiny allocations
-            continue
 
-        order_data = {
-            "symbol": sym,
-            "notional": str(alloc),
-            "side": "buy",
-            "type": "market",
-            "time_in_force": "day",
-        }
+    if replacements:
+        # Give each replacement an equal share of the freed cash
+        n_targets = len(replacements) + n_held
+        replacement_alloc = available / max(n_targets, 1)
 
-        try:
-            result = alpaca_request("POST", "v2/orders", mc, data=order_data, logger=logger)
-            order_id = result.get("id", "?")
-            order_status = result.get("status", "submitted")
-            logger.info(f"[REDISTRIBUTE] {mc.name}: BUY {sym} ${alloc:.2f} "
-                        f"(weight={weight:.1%}) → {order_status}")
-
-            # Poll for fill
-            fill_price = None
-            filled_qty = 0
-            if order_id and order_id != "?" and order_status not in ("rejected", "canceled", "expired"):
-                try:
-                    final = _poll_order_status(order_id, mc, logger)
-                    order_status = final.get("status", order_status)
-                    fq = final.get("filled_qty")
-                    fp = final.get("filled_avg_price")
-                    if fq and fq != "0":
-                        filled_qty = float(fq)
-                    if fp and fp != "0":
-                        fill_price = float(fp)
-                except Exception:
-                    pass
-
-            # Journal the redistribution buy
-            record = TradeRecord(
-                trade_id=f"{mc.name}_redist_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{sym}",
-                run_id=f"{mc.name}_cutloss_{datetime.now(timezone.utc).strftime('%Y%m%d')}",
-                model=mc.name,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                symbol=sym,
-                side="buy",
-                action="redistribute",
-                order_type="market",
-                time_in_force="day",
-                notional_usd=alloc,
-                order_status=order_status,
-                order_id=order_id,
-                shares=filled_qty,
-                fill_price=fill_price,
+        for sym, score in replacements:
+            alloc = round(replacement_alloc, 2)
+            if alloc < 10:
+                continue
+            n_bought += _place_redistribute_buy(
+                mc, sym, alloc, "replacement", score, journal, logger
             )
-            journal.log_trade(record)
-            n_bought += 1
 
-        except Exception as e:
-            logger.error(f"[REDISTRIBUTE] {mc.name}: failed to buy {sym}: {e}")
+        # Remaining cash goes proportionally to existing positions
+        used = replacement_alloc * len(replacements)
+        leftover = available - used
+    else:
+        leftover = available
+
+    # Distribute leftover across existing positions proportionally
+    if leftover > 50 and positions:
+        remaining = []
+        total_mv = 0
+        for p in positions:
+            sym = p["symbol"]
+            if sym in sold_symbols:
+                continue
+            mv = float(p.get("market_value", 0))
+            if mv > 0:
+                remaining.append({"symbol": sym, "market_value": mv})
+                total_mv += mv
+
+        if remaining and total_mv > 0:
+            for pos in remaining:
+                sym = pos["symbol"]
+                weight = pos["market_value"] / total_mv
+                alloc = round(leftover * weight, 2)
+                if alloc < 5:
+                    continue
+                n_bought += _place_redistribute_buy(
+                    mc, sym, alloc, "topup", 0, journal, logger
+                )
 
     logger.info(f"[REDISTRIBUTE] {mc.name}: completed — {n_bought} buys placed, "
-                f"${available:.2f} redistributed")
+                f"${available:.2f} redistributed, "
+                f"{n_held + len(replacements)}/{TOP_N} target positions")
+
+
+def _place_redistribute_buy(mc: ModelConfig, symbol: str, alloc: float,
+                             action: str, score: float,
+                             journal, logger) -> int:
+    """Place a single redistribution buy order. Returns 1 on success, 0 on failure."""
+    order_data = {
+        "symbol": symbol,
+        "notional": str(alloc),
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "day",
+    }
+
+    try:
+        result = alpaca_request("POST", "v2/orders", mc, data=order_data, logger=logger)
+        order_id = result.get("id", "?")
+        order_status = result.get("status", "submitted")
+        label = f"NEW {symbol}" if action == "replacement" else f"TOP-UP {symbol}"
+        logger.info(f"[REDISTRIBUTE] {mc.name}: {label} ${alloc:.2f}"
+                    f"{f' (score={score:.4f})' if score else ''} → {order_status}")
+
+        # Poll for fill
+        fill_price = None
+        filled_qty = 0
+        if order_id and order_id != "?" and order_status not in ("rejected", "canceled", "expired"):
+            try:
+                final = _poll_order_status(order_id, mc, logger)
+                order_status = final.get("status", order_status)
+                fq = final.get("filled_qty")
+                fp = final.get("filled_avg_price")
+                if fq and fq != "0":
+                    filled_qty = float(fq)
+                if fp and fp != "0":
+                    fill_price = float(fp)
+            except Exception:
+                pass
+
+        record = TradeRecord(
+            trade_id=f"{mc.name}_redist_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{symbol}",
+            run_id=f"{mc.name}_cutloss_{datetime.now(timezone.utc).strftime('%Y%m%d')}",
+            model=mc.name,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            side="buy",
+            action=f"redistribute_{action}",
+            order_type="market",
+            time_in_force="day",
+            notional_usd=alloc,
+            order_status=order_status,
+            order_id=order_id,
+            shares=filled_qty,
+            fill_price=fill_price,
+        )
+        journal.log_trade(record)
+        return 1
+
+    except Exception as e:
+        logger.error(f"[REDISTRIBUTE] {mc.name}: failed to buy {symbol}: {e}")
+        return 0
 
 
 def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
