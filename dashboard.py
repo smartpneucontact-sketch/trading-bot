@@ -579,7 +579,9 @@ def handle_exception(e):
 
 def _get_log_files() -> list[Path]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    return sorted(LOG_DIR.glob("pipeline_*.log"), reverse=True)
+    pipeline_logs = list(LOG_DIR.glob("pipeline_*.log"))
+    cutloss_logs = list(LOG_DIR.glob("cutloss_*.log"))
+    return sorted(pipeline_logs + cutloss_logs, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def _read_log(path: Path, tail: int = 200) -> str:
