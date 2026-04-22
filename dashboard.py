@@ -1090,7 +1090,37 @@ def api_config_test_key():
 @app.route("/api/logs")
 def api_logs_list():
     files = _get_log_files()[:50]
-    return jsonify([f.name for f in files])
+    result = []
+    for f in files:
+        name = f.name
+        if name.startswith("pipeline_"):
+            cat = "pipeline"
+            # Extract model from filename: pipeline_v7_20260422_133527.log
+            parts = name.replace("pipeline_", "").split("_")
+            model = parts[0].upper() if parts else "?"
+            date_str = parts[1] if len(parts) > 1 else ""
+        elif name.startswith("cutloss_"):
+            cat = "cutloss"
+            model = "ALL"
+            date_str = name.replace("cutloss_", "").replace(".log", "")
+        else:
+            cat = "other"
+            model = "?"
+            date_str = ""
+        # Format date nicely: 20260422 -> 2026-04-22
+        if len(date_str) == 8:
+            date_display = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+        else:
+            date_display = date_str
+        size_kb = round(f.stat().st_size / 1024, 1)
+        result.append({
+            "filename": name,
+            "category": cat,
+            "model": model,
+            "date": date_display,
+            "size_kb": size_kb,
+        })
+    return jsonify(result)
 
 
 @app.route("/api/logs/<filename>")
@@ -1098,7 +1128,8 @@ def api_log_content(filename):
     log_path = (LOG_DIR / filename).resolve()
     if not str(log_path).startswith(str(LOG_DIR.resolve())):
         return jsonify({"error": "Not found"}), 404
-    if not log_path.exists() or not filename.startswith("pipeline_"):
+    allowed_prefixes = ("pipeline_", "cutloss_")
+    if not log_path.exists() or not any(filename.startswith(p) for p in allowed_prefixes):
         return jsonify({"error": "Not found"}), 404
     content = _read_log(log_path, tail=300)
     return jsonify({"filename": filename, "content": content})
@@ -1687,10 +1718,24 @@ def index():
     <!-- Logs section -->
     <div class="card">
         <h2>Logs</h2>
-        <select id="log-select" onchange="loadLog(this.value)">
-            <option value="">Select a log file...</option>
-        </select>
-        <div id="log-box" class="log-box" style="margin-top:10px">No log selected</div>
+        <p style="color:var(--text-dim);font-size:12px;margin:-4px 0 12px 0;">
+            <strong>Pipeline</strong> — model runs: data download, predictions, rebalancing.
+            <strong>Cut-Loss</strong> — intraday scanner: stop triggers, sells, redistributions.
+        </p>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <div class="sub-tabs" style="margin:0;">
+                <button class="sub-tab active" id="log-filter-all" onclick="filterLogs('all')">All</button>
+                <button class="sub-tab" id="log-filter-pipeline" onclick="filterLogs('pipeline')">Pipeline</button>
+                <button class="sub-tab" id="log-filter-cutloss" onclick="filterLogs('cutloss')">Cut-Loss</button>
+            </div>
+            <select id="log-model-filter" onchange="filterLogs(currentLogFilter)" style="
+                background:var(--card-bg);color:var(--text);border:1px solid var(--card-border);
+                border-radius:6px;padding:4px 8px;font-size:12px;">
+                <option value="">All models</option>
+            </select>
+        </div>
+        <div id="log-list" style="margin-top:10px;max-height:180px;overflow-y:auto;"></div>
+        <div id="log-box" class="log-box" style="margin-top:10px">Select a log file above to view its contents.</div>
     </div>
 
     <!-- Error display -->
@@ -2333,21 +2378,73 @@ def index():
         container.innerHTML = html;
     }}
 
+    let allLogs = [];
+    let currentLogFilter = 'all';
+
     async function loadLogsList() {{
-        const logs = await api('/api/logs');
-        if (logs && logs.length > 0) {{
-            const sel = $('log-select');
-            sel.innerHTML = '<option value="">Select a log file...</option>';
-            logs.forEach(name => {{
-                sel.innerHTML += `<option value="${{name}}">${{name}}</option>`;
-            }});
+        allLogs = await api('/api/logs') || [];
+        // Populate model filter dropdown
+        const models = [...new Set(allLogs.map(l => l.model).filter(m => m && m !== '?' && m !== 'ALL'))];
+        const modelSel = $('log-model-filter');
+        modelSel.innerHTML = '<option value="">All models</option>';
+        models.sort().forEach(m => {{
+            modelSel.innerHTML += `<option value="${{m}}">${{m}}</option>`;
+        }});
+        filterLogs('all');
+    }}
+
+    function filterLogs(category) {{
+        currentLogFilter = category;
+        // Update tab styling
+        ['all','pipeline','cutloss'].forEach(c => {{
+            const btn = $(`log-filter-${{c}}`);
+            if (btn) btn.className = 'sub-tab' + (c === category ? ' active' : '');
+        }});
+
+        const modelFilter = $('log-model-filter').value;
+        const filtered = allLogs.filter(l => {{
+            if (category !== 'all' && l.category !== category) return false;
+            if (modelFilter && l.model !== modelFilter && l.model !== 'ALL') return false;
+            return true;
+        }});
+
+        const list = $('log-list');
+        if (filtered.length === 0) {{
+            list.innerHTML = '<p style="color:var(--text-dim);font-size:12px;padding:8px;">No log files found.</p>';
+            return;
         }}
+
+        let html = '<table style="width:100%;font-size:12px;">';
+        html += '<tr><th style="text-align:left;padding:4px 8px;">File</th><th>Type</th><th>Model</th><th>Date</th><th>Size</th></tr>';
+        filtered.forEach(l => {{
+            const typeBadge = l.category === 'cutloss'
+                ? '<span style="background:#ef444433;color:#ef4444;padding:1px 6px;border-radius:4px;font-size:10px;">CUT-LOSS</span>'
+                : '<span style="background:#3b82f633;color:#3b82f6;padding:1px 6px;border-radius:4px;font-size:10px;">PIPELINE</span>';
+            html += `<tr style="cursor:pointer;border-bottom:1px solid var(--card-border);"
+                         onclick="loadLog('${{l.filename}}')"
+                         onmouseover="this.style.background='var(--card-border)'"
+                         onmouseout="this.style.background='transparent'">
+                <td style="padding:6px 8px;font-family:var(--mono);color:var(--accent);">${{l.filename}}</td>
+                <td style="padding:6px 8px;text-align:center;">${{typeBadge}}</td>
+                <td style="padding:6px 8px;text-align:center;font-weight:600;">${{l.model}}</td>
+                <td style="padding:6px 8px;text-align:center;font-family:var(--mono);">${{l.date}}</td>
+                <td style="padding:6px 8px;text-align:right;font-family:var(--mono);">${{l.size_kb}}kb</td>
+            </tr>`;
+        }});
+        html += '</table>';
+        list.innerHTML = html;
     }}
 
     async function loadLog(filename) {{
         if (!filename) return;
+        $('log-box').textContent = 'Loading...';
         const data = await api(`/api/logs/${{filename}}`);
-        if (data) $('log-box').textContent = data.content;
+        if (data) {{
+            $('log-box').textContent = data.content;
+            // Scroll log box to bottom (most recent entries)
+            const box = $('log-box');
+            box.scrollTop = box.scrollHeight;
+        }}
     }}
 
     // ── Triggers ────────────────────────────────────────
