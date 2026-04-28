@@ -851,57 +851,151 @@ def _alpaca_data_get(mc, path: str, params: dict, timeout: int = 30):
     )
 
 
-def _fetch_bars_paged(mc, symbols: list, start_iso: str, logger=None) -> dict:
-    """Fetch daily bars for `symbols` since `start_iso`, batching to stay under
-    Alpaca's per-request symbol limit and paginating on `next_page_token`.
+# Cache the working data feed so we don't keep paying the 403 round-trip.
+# Cleared if a feed stops working (HTTP 4xx) so the next call re-discovers.
+_perf_active_feed: Optional[str] = None
+_perf_feed_lock = threading.Lock()
 
-    Returns {symbol: [bar, ...]} where each bar is the raw Alpaca dict (t/o/h/l/c/v).
-    Bars are returned chronologically per symbol.
+
+def _alpaca_bars_with_fallback(mc, path: str, base_params: dict, logger=None):
+    """Hit Alpaca with feed=sip → fall back to feed=iex on 401/403/422.
+
+    Caches the working feed in `_perf_active_feed` so subsequent calls go
+    straight to the working one. On any non-auth error, surface as-is.
+    Returns (response, feed_used).
+    """
+    global _perf_active_feed
+    with _perf_feed_lock:
+        cached = _perf_active_feed
+    feeds = [cached] if cached else ["sip", "iex"]
+    last_resp = None
+    for feed in feeds:
+        params = {**base_params, "feed": feed}
+        try:
+            resp = _alpaca_data_get(mc, path, params, timeout=30)
+        except Exception as e:
+            if logger:
+                logger.warning(f"[PERF] feed={feed} request failed: {e}")
+            continue
+        last_resp = resp
+        if resp.status_code == 200:
+            with _perf_feed_lock:
+                if _perf_active_feed != feed:
+                    _perf_active_feed = feed
+                    if logger:
+                        logger.info(f"[PERF] data feed selected: {feed}")
+            return resp, feed
+        if resp.status_code in (401, 403, 422):
+            if logger:
+                logger.info(
+                    f"[PERF] feed={feed} unavailable (HTTP {resp.status_code}); trying next"
+                )
+            # If the cached feed just failed, drop it so the next attempt
+            # re-discovers from the full feed list.
+            with _perf_feed_lock:
+                if _perf_active_feed == feed:
+                    _perf_active_feed = None
+            continue
+        # Non-auth HTTP error — return so caller can log + bail
+        return resp, feed
+    return last_resp, (feeds[-1] if feeds else "iex")
+
+
+def _to_alpaca_symbol(s: str) -> str:
+    """Convert yfinance-style class shares (BRK-B) to Alpaca-style (BRK.B).
+
+    The pipeline stores the universe in yfinance format because that's what
+    yfinance expects for class shares. Alpaca's data API uses a dot for the
+    same names. Pattern: ends with `-<single uppercase ASCII letter>`.
+    """
+    if (
+        len(s) >= 3
+        and s[-2] == "-"
+        and s[-1].isascii()
+        and s[-1].isalpha()
+        and s[-1].isupper()
+    ):
+        return s[:-2] + "." + s[-1]
+    return s
+
+
+def _fetch_bars_paged(mc, symbols: list, start_iso: str, logger=None) -> tuple:
+    """Fetch daily bars for `symbols` since `start_iso`.
+
+    - Translates yfinance-format class shares (BRK-B) to Alpaca format (BRK.B)
+      before sending to the API; results are mapped back to the original keys.
+    - Uses the SIP feed when available, falling back to IEX.
+    - Batches to stay under Alpaca's per-request symbol cap and paginates on
+      `next_page_token`.
+    - Logs a coverage summary so silent drops are visible in the logs UI.
+
+    Returns (bars_by_original_symbol, feed_used).
     """
     out: dict = {}
     BATCH = 180  # well under Alpaca's documented multi-symbol cap
 
-    for i in range(0, len(symbols), BATCH):
-        batch_syms = symbols[i:i + BATCH]
+    # original → alpaca and alpaca → original mappings
+    alpaca_to_original = {_to_alpaca_symbol(s): s for s in symbols}
+    alpaca_syms = list(alpaca_to_original.keys())
+
+    feed_used = None
+    for i in range(0, len(alpaca_syms), BATCH):
+        batch = alpaca_syms[i:i + BATCH]
         page_token = None
         pages = 0
         while True:
-            params = {
-                "symbols": ",".join(batch_syms),
+            base_params = {
+                "symbols": ",".join(batch),
                 "start": start_iso,
                 "timeframe": "1Day",
                 "limit": 10000,
                 "adjustment": "split",
-                "feed": "iex",
             }
             if page_token:
-                params["page_token"] = page_token
-            try:
-                resp = _alpaca_data_get(mc, "v2/stocks/bars", params, timeout=30)
-            except Exception as e:
+                base_params["page_token"] = page_token
+
+            resp, feed = _alpaca_bars_with_fallback(
+                mc, "v2/stocks/bars", base_params, logger=logger,
+            )
+            feed_used = feed
+
+            if resp is None or resp.status_code != 200:
                 if logger:
-                    logger.warning(f"[PERF] universe bars batch {i}: {e}")
-                break
-            if resp.status_code != 200:
-                if logger:
+                    code = resp.status_code if resp is not None else "no-response"
+                    body = resp.text[:200] if resp is not None else ""
                     logger.warning(
-                        f"[PERF] universe bars batch {i}: HTTP {resp.status_code} "
-                        f"{resp.text[:200]}"
+                        f"[PERF] universe bars batch {i} feed={feed}: HTTP {code} {body}"
                     )
                 break
+
             data = resp.json()
-            for sym, blist in (data.get("bars") or {}).items():
-                if blist:
-                    out.setdefault(sym, []).extend(blist)
+            for alpaca_sym, blist in (data.get("bars") or {}).items():
+                if not blist:
+                    continue
+                original = alpaca_to_original.get(alpaca_sym, alpaca_sym)
+                out.setdefault(original, []).extend(blist)
             page_token = data.get("next_page_token")
             pages += 1
             if not page_token or pages > 10:
                 break
-    return out
+
+    if logger:
+        got = set(out.keys())
+        missing = [s for s in symbols if s not in got]
+        sample = ", ".join(missing[:20]) if missing else ""
+        logger.info(
+            f"[PERF] Universe coverage on feed={feed_used}: "
+            f"{len(out)}/{len(symbols)} symbols got bars"
+            + (f" ({len(missing)} missing — first 20: {sample})" if missing else "")
+        )
+    return out, feed_used
 
 
-def _get_universe_bars(mc, syms: list, lookback_days: int, logger) -> dict:
-    """Get universe bars covering at least `lookback_days`, with caching."""
+def _get_universe_bars(mc, syms: list, lookback_days: int, logger) -> tuple:
+    """Get universe bars covering at least `lookback_days`, with caching.
+
+    Returns (bars_by_symbol, feed_used).
+    """
     # Pad start a few days for weekends/holidays to ensure we have a bar
     # before each window's nominal start.
     start_dt = datetime.now() - timedelta(days=lookback_days + 5)
@@ -915,7 +1009,7 @@ def _get_universe_bars(mc, syms: list, lookback_days: int, logger) -> dict:
             and time.time() - cache["fetched_at"] < UNIV_BARS_TTL
         )
         if fresh:
-            return cache["bars"]
+            return cache["bars"], cache.get("feed", "iex")
 
     # Fetch outside the lock — Alpaca calls take seconds. We accept the risk
     # that two requests both fetch; the second will simply overwrite.
@@ -923,17 +1017,18 @@ def _get_universe_bars(mc, syms: list, lookback_days: int, logger) -> dict:
         f"[PERF] Fetching universe bars: {len(syms)} symbols since {start_iso}"
     )
     t0 = time.time()
-    bars = _fetch_bars_paged(mc, syms, start_iso, logger=logger)
+    bars, feed = _fetch_bars_paged(mc, syms, start_iso, logger=logger)
     logger.info(
-        f"[PERF] Universe fetch: got bars for {len(bars)}/{len(syms)} symbols "
-        f"in {time.time() - t0:.1f}s"
+        f"[PERF] Universe fetch finished in {time.time() - t0:.1f}s "
+        f"(feed={feed})"
     )
 
     with _universe_bars_lock:
         _universe_bars_cache.update({
             "start": start_iso, "bars": bars, "fetched_at": time.time(),
+            "feed": feed,
         })
-    return bars
+    return bars, feed
 
 
 def _bar_return_in_window(bars: list, window_start_ms: int) -> Optional[float]:
@@ -1083,21 +1178,25 @@ def _compute_performance(model_name: str) -> dict:
         )
         max_window = max(max_window, days_since_inception)
 
-    universe_bars = _get_universe_bars(mc, universe_syms_clean, max_window, logger)
+    universe_bars, data_feed = _get_universe_bars(
+        mc, universe_syms_clean, max_window, logger,
+    )
 
     # SPY (separate single-symbol fetch — also cached implicitly inside the
     # universe call when "SPY" happens to be in syms; usually it isn't).
     spy_bars: list = []
+    start_dt = datetime.now() - timedelta(days=max_window + 5)
+    spy_params = {
+        "start": start_dt.strftime("%Y-%m-%d"),
+        "timeframe": "1Day",
+        "limit": 10000,
+        "adjustment": "split",
+    }
     try:
-        start_dt = datetime.now() - timedelta(days=max_window + 5)
-        resp = _alpaca_data_get(mc, "v2/stocks/SPY/bars", {
-            "start": start_dt.strftime("%Y-%m-%d"),
-            "timeframe": "1Day",
-            "limit": 10000,
-            "adjustment": "split",
-            "feed": "iex",
-        }, timeout=10)
-        if resp.status_code == 200:
+        resp, _ = _alpaca_bars_with_fallback(
+            mc, "v2/stocks/SPY/bars", spy_params, logger=logger,
+        )
+        if resp is not None and resp.status_code == 200:
             spy_bars = resp.json().get("bars") or []
     except Exception as e:
         logger.warning(f"[PERF] SPY fetch: {e}")
@@ -1158,6 +1257,7 @@ def _compute_performance(model_name: str) -> dict:
         "as_of": datetime.now().isoformat(timespec="seconds"),
         "n_positions": len(model_positions),
         "universe_size_total": len(universe_syms_clean),
+        "data_feed": data_feed,
         "windows": windows_out,
         "headline": {
             "window":       headline_window,
@@ -2673,8 +2773,12 @@ def index():
             <div style="font-size:13px;color:var(--text);">
                 ${{perfPctileNarrative(pctile, model, windowLabel)}}
             </div>
-            <div style="font-size:11px;color:var(--text-dim);margin-top:10px;">
-                Comparison universe: ${{w.univ_n}} stocks (out of ${{data.universe_size_total}} tradeable) — stocks without full price data for the window are excluded.
+            <div style="font-size:11px;color:var(--text-dim);margin-top:10px;line-height:1.5;">
+                Comparison universe: <strong>${{w.univ_n}}</strong> of ${{data.universe_size_total}} tradeable stocks
+                ${{data.data_feed ? `· data feed: <code style="color:var(--text);background:var(--card-border);padding:1px 5px;border-radius:3px;font-size:10px;">${{data.data_feed.toUpperCase()}}</code>` : ''}}
+                ${{(data.universe_size_total - w.univ_n) > 5
+                    ? `<br><span style="color:var(--text-dim);">${{data.universe_size_total - w.univ_n}} stocks lacked price data for this window — likely names with no trades on the ${{(data.data_feed || 'iex').toUpperCase()}} feed during the period.</span>`
+                    : ''}}
             </div>
         </div>`;
 
