@@ -2168,6 +2168,21 @@ def run_single_model(
     logger.info(f"\n  State: run #{state.get('run_count', 0) + 1}, "
                 f"last rebalance: {state.get('last_rebalance', 'never')}")
 
+    # Cut-loss circuit breaker: if portfolio_stop fired today, sit in cash
+    # for the rest of the session. Otherwise the rebalance would buy fresh
+    # positions that the next 60s cutloss tick would immediately liquidate
+    # again (the daily anchor is yesterday's close — see _cutloss_scan_model).
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    if state.get("portfolio_stop_tripped_date") == today_iso:
+        logger.warning(
+            f"  Skipping rebalance — portfolio_stop circuit breaker tripped "
+            f"earlier today ({today_iso}). Staying in cash until next session."
+        )
+        state["last_run"] = datetime.now().isoformat()
+        save_state(state, mc)
+        logger.info(report.format_summary())
+        return
+
     if not should_rebalance(state, force):
         last = datetime.fromisoformat(state["last_rebalance"])
         days_since = (datetime.now() - last).days
@@ -2358,13 +2373,10 @@ def run_single_model(
 # CUT-LOSS SCANNER — runs every minute during market hours for V7+
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Track peak prices per (model, symbol) for trailing stop
-_peak_prices: dict[tuple[str, str], float] = {}
-_peak_lock = threading.Lock()
-
-# Track daily portfolio start values for portfolio-level stop
-_daily_portfolio_start: dict[str, float] = {}
-_daily_portfolio_lock = threading.Lock()
+# Cut-loss state (peak prices, daily portfolio anchor, portfolio-stop trip flag)
+# is persisted per-model in mc.state_path. A single lock serialises read-modify-
+# write windows inside cutloss_scan so back-to-back scheduler ticks don't race.
+_cutloss_state_lock = threading.Lock()
 
 
 def _is_market_open() -> bool:
@@ -2441,13 +2453,6 @@ def cutloss_scan():
     if not cutloss_models:
         return
 
-    # Periodically clean up stale _peak_prices entries (inactive models)
-    cutloss_model_names = {mc.name for mc in cutloss_models}
-    with _peak_lock:
-        stale_keys = [k for k in _peak_prices if k[0] not in cutloss_model_names]
-        for k in stale_keys:
-            del _peak_prices[k]
-
     for mc in cutloss_models:
         try:
             _cutloss_scan_model(mc, logger)
@@ -2456,107 +2461,139 @@ def cutloss_scan():
 
 
 def _cutloss_scan_model(mc: ModelConfig, logger):
-    """Run cut-loss checks for a single model."""
-    # Fetch positions
-    try:
-        positions = alpaca_request("GET", "v2/positions", mc, logger=logger)
-    except Exception as e:
-        logger.warning(f"[CUTLOSS] {mc.name}: failed to fetch positions: {e}")
-        return
+    """Run cut-loss checks for a single model.
 
-    if not positions:
-        return
+    Cut-loss state (trip flag, daily anchor, peak prices) is persisted to
+    mc.state_path so it survives Railway redeploys and can be inspected /
+    reasoned about. Once portfolio_stop fires, the trip flag blocks any
+    further scans (and any rebalance) for the rest of the day.
+    """
+    today_iso = datetime.now().strftime("%Y-%m-%d")
 
-    n_positions = len(positions)
-    total_market_value = sum(float(p.get("market_value", 0)) for p in positions)
+    with _cutloss_state_lock:
+        state = load_state(mc)
 
-    # Fetch account for portfolio-level stop
-    try:
-        acct = alpaca_request("GET", "v2/account", mc, logger=logger)
-        current_equity = float(acct.get("equity", 0))
-        last_equity = float(acct.get("last_equity", 0))
-    except Exception as e:
-        logger.error(f"[CUTLOSS] {mc.name}: failed to fetch account: {e}")
-        return
-
-    # Initialize daily start if needed (first scan of the day)
-    today = datetime.now().strftime("%Y-%m-%d")
-    daily_key = f"{mc.name}_{today}"
-    with _daily_portfolio_lock:
-        if daily_key not in _daily_portfolio_start and last_equity > 0:
-            _daily_portfolio_start[daily_key] = last_equity
-            # Purge stale keys (older than today) to prevent unbounded growth
-            stale = [k for k in _daily_portfolio_start if not k.endswith(today)]
-            for k in stale:
-                del _daily_portfolio_start[k]
-        start_equity = _daily_portfolio_start.get(daily_key, last_equity)
-
-    # ── Portfolio-level stop check ───────────────────────────
-    if start_equity > 0 and current_equity > 0:
-        daily_drawdown_pct = (current_equity / start_equity - 1) * 100
-        if daily_drawdown_pct <= mc.cutloss_portfolio_stop:
-            logger.warning(
-                f"[CUTLOSS] {mc.name}: PORTFOLIO STOP triggered! "
-                f"Daily drawdown: {daily_drawdown_pct:.2f}% <= {mc.cutloss_portfolio_stop}%. "
-                f"Liquidating ALL {n_positions} positions (equity=${current_equity:,.2f})."
-            )
-            _liquidate_all(mc, positions, "portfolio_stop", logger)
-            logger.warning(
-                f"[CUTLOSS] {mc.name}: SUMMARY — liquidated all {n_positions} positions, "
-                f"0/{n_positions} remaining, equity=${current_equity:,.2f}"
-            )
+        # Trip-flag short-circuit: portfolio_stop already fired today → cash mode.
+        if state.get("portfolio_stop_tripped_date") == today_iso:
             return
 
-    # ── Per-position stop checks ─────────────────────────────
-    symbols_to_sell = []
-
-    for p in positions:
-        sym = p["symbol"]
-        qty = float(p.get("qty", 0))
-        avg_entry = float(p.get("avg_entry_price", 0))
-        current_price = float(p.get("current_price", 0))
-
-        if avg_entry <= 0 or current_price <= 0 or qty <= 0:
-            continue
-
-        # Update peak price for trailing stop
-        peak_key = (mc.name, sym)
-        with _peak_lock:
-            prev_peak = _peak_prices.get(peak_key, avg_entry)
-            current_peak = max(prev_peak, current_price)
-            _peak_prices[peak_key] = current_peak
-
-        # Hard stop: down X% from entry
-        pct_from_entry = (current_price / avg_entry - 1) * 100
-        if pct_from_entry <= mc.cutloss_hard_stop:
-            logger.warning(
-                f"[CUTLOSS] {mc.name}: HARD STOP on {sym}! "
-                f"{pct_from_entry:.2f}% from entry (threshold: {mc.cutloss_hard_stop}%)"
-            )
-            symbols_to_sell.append((sym, qty, "hard_stop", pct_from_entry))
-            continue
-
-        # Trailing stop: down X% from peak
-        pct_from_peak = (current_price / current_peak - 1) * 100
-        if pct_from_peak <= mc.cutloss_trailing_stop:
-            logger.warning(
-                f"[CUTLOSS] {mc.name}: TRAILING STOP on {sym}! "
-                f"{pct_from_peak:.2f}% from peak ${current_peak:.2f} "
-                f"(threshold: {mc.cutloss_trailing_stop}%)"
-            )
-            symbols_to_sell.append((sym, qty, "trailing_stop", pct_from_peak))
-            continue
-
-    # Execute sells
-    sold_symbols = []
-    for sym, qty, reason, pct in symbols_to_sell:
+        # Fetch positions
         try:
-            _execute_cutloss_sell(mc, sym, qty, reason, pct, logger)
-            sold_symbols.append(sym)
+            positions = alpaca_request("GET", "v2/positions", mc, logger=logger)
         except Exception as e:
-            logger.error(f"[CUTLOSS] {mc.name}: failed to sell {sym}: {e}")
+            logger.warning(f"[CUTLOSS] {mc.name}: failed to fetch positions: {e}")
+            return
 
-    # Summary after sells
+        if not positions:
+            return
+
+        n_positions = len(positions)
+
+        # Fetch account for portfolio-level stop
+        try:
+            acct = alpaca_request("GET", "v2/account", mc, logger=logger)
+            current_equity = float(acct.get("equity", 0))
+            last_equity = float(acct.get("last_equity", 0))
+        except Exception as e:
+            logger.error(f"[CUTLOSS] {mc.name}: failed to fetch account: {e}")
+            return
+
+        # Initialise / refresh the daily anchor on date change. last_equity
+        # is yesterday's close from Alpaca and is stable all day, so any
+        # intraday restart still measures drawdown from the same baseline.
+        state_dirty = False
+        if state.get("daily_portfolio_start_date") != today_iso:
+            anchor = last_equity if last_equity > 0 else current_equity
+            if anchor > 0:
+                state["daily_portfolio_start"] = anchor
+                state["daily_portfolio_start_date"] = today_iso
+                state_dirty = True
+        start_equity = state.get("daily_portfolio_start", last_equity)
+
+        # ── Portfolio-level stop check ───────────────────────────
+        if start_equity > 0 and current_equity > 0:
+            daily_drawdown_pct = (current_equity / start_equity - 1) * 100
+            if daily_drawdown_pct <= mc.cutloss_portfolio_stop:
+                logger.warning(
+                    f"[CUTLOSS] {mc.name}: PORTFOLIO STOP triggered! "
+                    f"Daily drawdown: {daily_drawdown_pct:.2f}% <= {mc.cutloss_portfolio_stop}%. "
+                    f"Liquidating ALL {n_positions} positions (equity=${current_equity:,.2f})."
+                )
+                # Persist the trip flag BEFORE liquidating — a crash mid-sell
+                # must still block rebuys for the rest of the day.
+                state["portfolio_stop_tripped_date"] = today_iso
+                state["peak_prices"] = {}
+                save_state(state, mc)
+
+                _liquidate_all(mc, positions, "portfolio_stop", logger)
+                logger.warning(
+                    f"[CUTLOSS] {mc.name}: SUMMARY — liquidated all {n_positions} positions, "
+                    f"0/{n_positions} remaining, equity=${current_equity:,.2f}"
+                )
+                return
+
+        # ── Per-position stop checks ─────────────────────────────
+        peak_prices = state.setdefault("peak_prices", {})
+        held_symbols = {p["symbol"] for p in positions}
+        # Prune peaks for positions no longer held.
+        for sym in list(peak_prices.keys()):
+            if sym not in held_symbols:
+                del peak_prices[sym]
+                state_dirty = True
+
+        symbols_to_sell = []
+
+        for p in positions:
+            sym = p["symbol"]
+            qty = float(p.get("qty", 0))
+            avg_entry = float(p.get("avg_entry_price", 0))
+            current_price = float(p.get("current_price", 0))
+
+            if avg_entry <= 0 or current_price <= 0 or qty <= 0:
+                continue
+
+            prev_peak = peak_prices.get(sym, avg_entry)
+            current_peak = max(prev_peak, current_price)
+            if peak_prices.get(sym) != current_peak:
+                peak_prices[sym] = current_peak
+                state_dirty = True
+
+            # Hard stop: down X% from entry
+            pct_from_entry = (current_price / avg_entry - 1) * 100
+            if pct_from_entry <= mc.cutloss_hard_stop:
+                logger.warning(
+                    f"[CUTLOSS] {mc.name}: HARD STOP on {sym}! "
+                    f"{pct_from_entry:.2f}% from entry (threshold: {mc.cutloss_hard_stop}%)"
+                )
+                symbols_to_sell.append((sym, qty, "hard_stop", pct_from_entry))
+                continue
+
+            # Trailing stop: down X% from peak
+            pct_from_peak = (current_price / current_peak - 1) * 100
+            if pct_from_peak <= mc.cutloss_trailing_stop:
+                logger.warning(
+                    f"[CUTLOSS] {mc.name}: TRAILING STOP on {sym}! "
+                    f"{pct_from_peak:.2f}% from peak ${current_peak:.2f} "
+                    f"(threshold: {mc.cutloss_trailing_stop}%)"
+                )
+                symbols_to_sell.append((sym, qty, "trailing_stop", pct_from_peak))
+                continue
+
+        # Execute sells
+        sold_symbols = []
+        for sym, qty, reason, pct in symbols_to_sell:
+            try:
+                _execute_cutloss_sell(mc, sym, qty, reason, pct, logger)
+                sold_symbols.append(sym)
+                if peak_prices.pop(sym, None) is not None:
+                    state_dirty = True
+            except Exception as e:
+                logger.error(f"[CUTLOSS] {mc.name}: failed to sell {sym}: {e}")
+
+        if state_dirty:
+            save_state(state, mc)
+
+    # Summary after sells (outside the lock — pure logging + redistribute)
     if sold_symbols:
         remaining = n_positions - len(sold_symbols)
         logger.info(
@@ -2833,11 +2870,9 @@ def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
             fill_price=fill_price,
         )
         journal.log_trade(record)
-
-        # Clear peak tracking for this symbol (only if order was accepted)
-        if order_status not in ("rejected", "canceled", "expired"):
-            peak_key = (mc.name, symbol)
-            _peak_prices.pop(peak_key, None)
+        # Peak-price tracking is owned by the caller (cutloss_scan_model uses
+        # the per-model state dict; _liquidate_all wipes the whole dict before
+        # invoking us). We deliberately do not touch it here.
 
     except Exception as e:
         logger.error(f"[CUTLOSS] {mc.name}: order failed for {symbol}: {e}")
@@ -2845,7 +2880,12 @@ def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
 
 
 def _liquidate_all(mc: ModelConfig, positions: list, reason: str, logger):
-    """Liquidate all positions for a model (portfolio-level stop)."""
+    """Liquidate all positions for a model (portfolio-level stop).
+
+    The caller is responsible for wiping `state["peak_prices"]` before we
+    place sells — that way the trip flag and an empty peak dict are
+    persisted atomically even if a sell fails midway.
+    """
     logger.warning(f"[CUTLOSS] {mc.name}: LIQUIDATING ALL {len(positions)} positions ({reason})")
 
     for p in positions:
@@ -2856,12 +2896,6 @@ def _liquidate_all(mc: ModelConfig, positions: list, reason: str, logger):
                 _execute_cutloss_sell(mc, sym, qty, reason, 0.0, logger)
             except Exception as e:
                 logger.error(f"[CUTLOSS] {mc.name}: failed to liquidate {sym}: {e}")
-
-    # Clear all peak tracking for this model
-    with _peak_lock:
-        keys_to_remove = [k for k in _peak_prices if k[0] == mc.name]
-        for k in keys_to_remove:
-            _peak_prices.pop(k, None)
 
 
 def run_pipeline(dry_run: bool = False, force: bool = False,

@@ -24,6 +24,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -584,14 +585,24 @@ def _get_log_files() -> list[Path]:
     return sorted(pipeline_logs + cutloss_logs, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def _read_log(path: Path, tail: int = 200) -> str:
+def _read_log(path: Path, tail: int = 200, level: str = None) -> tuple[str, int, int]:
+    """Read a log file, optionally tailed and level-filtered.
+
+    Returns (content, total_line_count, returned_line_count).
+    `tail`: 0 or negative means "all lines".
+    `level`: if set (ERROR | WARNING), keep only lines containing that token.
+    """
     try:
         lines = path.read_text().splitlines()
-        if len(lines) > tail:
-            return f"... ({len(lines) - tail} lines omitted)\n" + "\n".join(lines[-tail:])
-        return "\n".join(lines)
+        total = len(lines)
+        if level:
+            tag = f"[{level.upper()}]"
+            lines = [ln for ln in lines if tag in ln]
+        if tail and tail > 0 and len(lines) > tail:
+            lines = lines[-tail:]
+        return "\n".join(lines), total, len(lines)
     except Exception as e:
-        return f"Error reading log: {e}"
+        return f"Error reading log: {e}", 0, 0
 
 
 # ── API ENDPOINTS ─────────────────────────────────────────────────────────
@@ -1123,16 +1134,48 @@ def api_logs_list():
     return jsonify(result)
 
 
-@app.route("/api/logs/<filename>")
-def api_log_content(filename):
+def _resolve_log_path(filename: str) -> Optional[Path]:
+    """Validate `filename` and return its absolute Path, or None if invalid."""
     log_path = (LOG_DIR / filename).resolve()
     if not str(log_path).startswith(str(LOG_DIR.resolve())):
-        return jsonify({"error": "Not found"}), 404
+        return None
     allowed_prefixes = ("pipeline_", "cutloss_")
     if not log_path.exists() or not any(filename.startswith(p) for p in allowed_prefixes):
+        return None
+    return log_path
+
+
+@app.route("/api/logs/<filename>")
+def api_log_content(filename):
+    log_path = _resolve_log_path(filename)
+    if log_path is None:
         return jsonify({"error": "Not found"}), 404
-    content = _read_log(log_path, tail=300)
-    return jsonify({"filename": filename, "content": content})
+
+    # ?tail=500 (default) | 100 | 2000 | all
+    tail_arg = (flask_request.args.get("tail") or "500").lower()
+    tail = 0 if tail_arg == "all" else max(0, int(tail_arg)) if tail_arg.isdigit() else 500
+    level = flask_request.args.get("level")  # ERROR | WARNING | None
+
+    content, total, returned = _read_log(log_path, tail=tail, level=level)
+    return jsonify({
+        "filename": filename,
+        "content": content,
+        "total_lines": total,
+        "returned_lines": returned,
+        "mtime": log_path.stat().st_mtime,
+    })
+
+
+@app.route("/api/logs/<filename>/download")
+def api_log_download(filename):
+    log_path = _resolve_log_path(filename)
+    if log_path is None:
+        return jsonify({"error": "Not found"}), 404
+    return Response(
+        log_path.read_bytes(),
+        mimetype="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ── ACTIONS ───────────────────────────────────────────────────────────────
@@ -1642,9 +1685,31 @@ def index():
 
         /* Log */
         .log-box {{ background: #0a0c10; border: 1px solid var(--card-border); border-radius: 8px;
-                   padding: 14px; font-family: var(--mono); font-size: 11px; line-height: 1.6;
-                   max-height: 400px; overflow-y: auto; white-space: pre-wrap;
+                   padding: 14px; font-family: var(--mono); font-size: 11px; line-height: 1.55;
+                   max-height: 520px; overflow-y: auto; white-space: pre-wrap;
                    word-break: break-all; color: #8b95a8; }}
+        .log-line {{ display: block; padding: 0 4px; border-radius: 2px; }}
+        .log-line.info {{ color: #8b95a8; }}
+        .log-line.warn {{ color: #f59e0b; }}
+        .log-line.err  {{ color: #f87171; background: rgba(239, 68, 68, 0.07); }}
+        .log-line.crit {{ color: #fff;     background: rgba(239, 68, 68, 0.4);
+                          font-weight: 600; padding: 2px 6px; }}
+        .log-line.match {{ background: rgba(245, 158, 11, 0.18);
+                           outline: 1px solid rgba(245, 158, 11, 0.4); }}
+        .log-line.hidden {{ display: none; }}
+        .log-controls {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+                         margin: 8px 0; font-size: 12px; }}
+        .log-controls input[type=search] {{
+            background: var(--card); color: var(--text); border: 1px solid var(--card-border);
+            padding: 6px 10px; border-radius: 6px; font-size: 12px; min-width: 180px;
+            font-family: var(--mono);
+        }}
+        .log-controls input[type=search]:focus {{ outline: none; border-color: var(--accent); }}
+        .log-controls label {{ color: var(--text-dim); font-size: 11px; display: flex;
+                               gap: 5px; align-items: center; cursor: pointer; }}
+        .log-controls .live-on {{ color: var(--green); font-weight: 600; }}
+        .log-meta {{ color: var(--text-dim); font-size: 11px; margin-left: auto;
+                     font-family: var(--mono); }}
 
         /* Buttons */
         .btn {{ display: inline-block; padding: 7px 18px; border-radius: 6px; font-size: 12px;
@@ -1734,8 +1799,37 @@ def index():
                 <option value="">All models</option>
             </select>
         </div>
-        <div id="log-list" style="margin-top:10px;max-height:180px;overflow-y:auto;"></div>
-        <div id="log-box" class="log-box" style="margin-top:10px">Select a log file above to view its contents.</div>
+        <div id="log-list" style="margin-top:10px;max-height:220px;overflow-y:auto;"></div>
+
+        <div class="log-controls">
+            <input type="search" id="log-search" placeholder="Search lines (e.g. portfolio_stop, AAPL)…"
+                   oninput="applyLogSearch()" />
+            <label>
+                Tail
+                <select id="log-tail" onchange="reloadCurrentLog()">
+                    <option value="100">100</option>
+                    <option value="500" selected>500</option>
+                    <option value="2000">2000</option>
+                    <option value="all">All</option>
+                </select>
+            </label>
+            <label>
+                Level
+                <select id="log-level" onchange="reloadCurrentLog()">
+                    <option value="">All</option>
+                    <option value="WARNING">Warn+</option>
+                    <option value="ERROR">Errors</option>
+                </select>
+            </label>
+            <label onclick="toggleLiveTail()">
+                <input type="checkbox" id="log-live" /> <span id="log-live-label">Live tail</span>
+            </label>
+            <button class="btn btn-secondary" id="log-download-btn" style="padding:5px 12px;font-size:11px"
+                    onclick="downloadCurrentLog()" disabled>Download raw</button>
+            <span class="log-meta" id="log-meta"></span>
+        </div>
+
+        <div id="log-box" class="log-box">Select a log file above to view its contents.</div>
     </div>
 
     <!-- Error display -->
@@ -2380,22 +2474,34 @@ def index():
 
     let allLogs = [];
     let currentLogFilter = 'all';
+    let currentLogFile = null;
+    let liveTailHandle = null;
+    const CRITICAL_TOKENS = [
+        'PORTFOLIO STOP', 'HARD STOP', 'TRAILING STOP',
+        'LIQUIDATING', 'FATAL', 'FAILED', 'circuit breaker'
+    ];
 
     async function loadLogsList() {{
         allLogs = await api('/api/logs') || [];
-        // Populate model filter dropdown
         const models = [...new Set(allLogs.map(l => l.model).filter(m => m && m !== '?' && m !== 'ALL'))];
         const modelSel = $('log-model-filter');
+        const prev = modelSel.value;
         modelSel.innerHTML = '<option value="">All models</option>';
         models.sort().forEach(m => {{
             modelSel.innerHTML += `<option value="${{m}}">${{m}}</option>`;
         }});
-        filterLogs('all');
+        if (prev) modelSel.value = prev;
+        filterLogs(currentLogFilter);
+
+        // First-paint convenience: auto-load the most recent log if nothing
+        // is currently being viewed.
+        if (!currentLogFile && allLogs.length > 0) {{
+            loadLog(allLogs[0].filename);
+        }}
     }}
 
     function filterLogs(category) {{
         currentLogFilter = category;
-        // Update tab styling
         ['all','pipeline','cutloss'].forEach(c => {{
             const btn = $(`log-filter-${{c}}`);
             if (btn) btn.className = 'sub-tab' + (c === category ? ' active' : '');
@@ -2414,37 +2520,164 @@ def index():
             return;
         }}
 
-        let html = '<table style="width:100%;font-size:12px;">';
-        html += '<tr><th style="text-align:left;padding:4px 8px;">File</th><th>Type</th><th>Model</th><th>Date</th><th>Size</th></tr>';
+        // Group by date — most recent first
+        const byDate = new Map();
         filtered.forEach(l => {{
-            const typeBadge = l.category === 'cutloss'
-                ? '<span style="background:#ef444433;color:#ef4444;padding:1px 6px;border-radius:4px;font-size:10px;">CUT-LOSS</span>'
-                : '<span style="background:#3b82f633;color:#3b82f6;padding:1px 6px;border-radius:4px;font-size:10px;">PIPELINE</span>';
-            html += `<tr style="cursor:pointer;border-bottom:1px solid var(--card-border);"
-                         onclick="loadLog('${{l.filename}}')"
-                         onmouseover="this.style.background='var(--card-border)'"
-                         onmouseout="this.style.background='transparent'">
-                <td style="padding:6px 8px;font-family:var(--mono);color:var(--accent);">${{l.filename}}</td>
-                <td style="padding:6px 8px;text-align:center;">${{typeBadge}}</td>
-                <td style="padding:6px 8px;text-align:center;font-weight:600;">${{l.model}}</td>
-                <td style="padding:6px 8px;text-align:center;font-family:var(--mono);">${{l.date}}</td>
-                <td style="padding:6px 8px;text-align:right;font-family:var(--mono);">${{l.size_kb}}kb</td>
-            </tr>`;
+            const d = l.date || '?';
+            if (!byDate.has(d)) byDate.set(d, []);
+            byDate.get(d).push(l);
         }});
-        html += '</table>';
+
+        let html = '';
+        for (const [date, files] of byDate) {{
+            const npipe = files.filter(f => f.category === 'pipeline').length;
+            const ncut = files.filter(f => f.category === 'cutloss').length;
+            html += `<div style="margin:6px 0 2px 0;color:var(--text-dim);font-size:11px;
+                                 text-transform:uppercase;letter-spacing:1px;">
+                ${{date}} <span style="color:var(--text-dim);text-transform:none;letter-spacing:0;
+                                       font-size:10px;margin-left:6px;">
+                    ${{npipe}} pipeline · ${{ncut}} cut-loss
+                </span>
+            </div>`;
+            html += '<table style="width:100%;font-size:12px;border-collapse:collapse;">';
+            files.forEach(l => {{
+                const typeBadge = l.category === 'cutloss'
+                    ? '<span style="background:#ef444433;color:#ef4444;padding:1px 6px;border-radius:4px;font-size:10px;">CUT-LOSS</span>'
+                    : '<span style="background:#3b82f633;color:#3b82f6;padding:1px 6px;border-radius:4px;font-size:10px;">PIPELINE</span>';
+                const isActive = (l.filename === currentLogFile);
+                html += `<tr style="cursor:pointer;border-bottom:1px solid var(--card-border);
+                                    background:${{isActive ? 'rgba(59,130,246,0.12)' : 'transparent'}};"
+                             onclick="loadLog('${{l.filename}}')"
+                             onmouseover="this.style.background='var(--card-border)'"
+                             onmouseout="this.style.background='${{isActive ? 'rgba(59,130,246,0.12)' : 'transparent'}}'">
+                    <td style="padding:5px 8px;font-family:var(--mono);color:var(--accent);">${{l.filename}}</td>
+                    <td style="padding:5px 8px;text-align:center;">${{typeBadge}}</td>
+                    <td style="padding:5px 8px;text-align:center;font-weight:600;">${{l.model}}</td>
+                    <td style="padding:5px 8px;text-align:right;font-family:var(--mono);">${{l.size_kb}}kb</td>
+                </tr>`;
+            }});
+            html += '</table>';
+        }}
         list.innerHTML = html;
     }}
 
-    async function loadLog(filename) {{
+    function classifyLine(line) {{
+        // Critical events take priority over level so PORTFOLIO STOP at INFO
+        // still gets the red banner.
+        for (const token of CRITICAL_TOKENS) {{
+            if (line.indexOf(token) !== -1) return 'crit';
+        }}
+        if (line.indexOf('[ERROR]') !== -1) return 'err';
+        if (line.indexOf('[WARNING]') !== -1) return 'warn';
+        return 'info';
+    }}
+
+    function escapeHtml(s) {{
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }}
+
+    function renderLogContent(content) {{
+        const lines = content.split('\\n');
+        const out = [];
+        for (const ln of lines) {{
+            const cls = classifyLine(ln);
+            out.push('<span class="log-line ' + cls + '">' + escapeHtml(ln || '​') + '</span>');
+        }}
+        return out.join('');
+    }}
+
+    function buildLogQuery() {{
+        const tail = $('log-tail').value;
+        const level = $('log-level').value;
+        const params = new URLSearchParams();
+        if (tail) params.set('tail', tail);
+        if (level) params.set('level', level);
+        const qs = params.toString();
+        return qs ? '?' + qs : '';
+    }}
+
+    async function loadLog(filename, opts) {{
+        opts = opts || {{}};
         if (!filename) return;
-        $('log-box').textContent = 'Loading...';
-        const data = await api(`/api/logs/${{filename}}`);
-        if (data) {{
-            $('log-box').textContent = data.content;
-            // Scroll log box to bottom (most recent entries)
-            const box = $('log-box');
+        currentLogFile = filename;
+        if (!opts.silent) $('log-box').innerHTML = '<span style="color:var(--text-dim);">Loading…</span>';
+        $('log-download-btn').disabled = false;
+
+        const data = await api(`/api/logs/${{filename}}` + buildLogQuery());
+        if (!data) return;
+
+        $('log-box').innerHTML = renderLogContent(data.content);
+        const meta = $('log-meta');
+        if (data.total_lines != null) {{
+            meta.textContent = `${{data.returned_lines}} / ${{data.total_lines}} lines`;
+        }}
+
+        applyLogSearch();
+
+        // Refresh the file list so the active row gets highlighted.
+        if (!opts.silent) filterLogs(currentLogFilter);
+
+        // Stick to bottom unless the user has scrolled up.
+        const box = $('log-box');
+        if (opts.silent) {{
+            // live tail: only auto-scroll if user was already at bottom
+            const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+            if (wasAtBottom) box.scrollTop = box.scrollHeight;
+        }} else {{
             box.scrollTop = box.scrollHeight;
         }}
+    }}
+
+    function reloadCurrentLog() {{
+        if (currentLogFile) loadLog(currentLogFile);
+    }}
+
+    function applyLogSearch() {{
+        const q = ($('log-search').value || '').trim().toLowerCase();
+        const lines = $('log-box').querySelectorAll('.log-line');
+        let matches = 0;
+        lines.forEach(el => {{
+            el.classList.remove('match', 'hidden');
+            if (!q) return;
+            const text = el.textContent.toLowerCase();
+            if (text.indexOf(q) === -1) {{
+                el.classList.add('hidden');
+            }} else {{
+                el.classList.add('match');
+                matches += 1;
+            }}
+        }});
+        const meta = $('log-meta');
+        if (q && meta && currentLogFile) {{
+            meta.textContent = `${{matches}} match${{matches === 1 ? '' : 'es'}} for "${{q}}"`;
+        }} else if (currentLogFile) {{
+            // Restore the line counter from the box's data
+            const total = $('log-box').querySelectorAll('.log-line').length;
+            meta.textContent = `${{total}} lines`;
+        }}
+    }}
+
+    function toggleLiveTail() {{
+        const cb = $('log-live');
+        // The label fires onclick; checkbox state has already toggled by then
+        const labelSpan = $('log-live-label');
+        if (cb.checked) {{
+            labelSpan.classList.add('live-on');
+            labelSpan.textContent = 'Live tail (5s)';
+            if (liveTailHandle) clearInterval(liveTailHandle);
+            liveTailHandle = setInterval(() => {{
+                if (currentLogFile) loadLog(currentLogFile, {{ silent: true }});
+            }}, 5000);
+        }} else {{
+            labelSpan.classList.remove('live-on');
+            labelSpan.textContent = 'Live tail';
+            if (liveTailHandle) {{ clearInterval(liveTailHandle); liveTailHandle = null; }}
+        }}
+    }}
+
+    function downloadCurrentLog() {{
+        if (!currentLogFile) return;
+        window.location.href = `/api/logs/${{currentLogFile}}/download`;
     }}
 
     // ── Triggers ────────────────────────────────────────
