@@ -788,11 +788,236 @@ def _get_universe_symbols() -> list[str]:
         return []
 
 
+"""Performance is the model's *equity-curve* return measured over four windows
+(1d, 7d, 30d, inception) compared to the same-window return of every stock
+in the model's tradeable universe.
+
+The headline metric is the **percentile rank** of the model's return within
+the distribution of universe returns — "V6 returned +X% in 30d, beating Y%
+of the universe." This captures stock-picking skill, execution timing, and
+risk management in a single number that is comparable across windows."""
+
+PERF_WINDOWS = [("1d", 1), ("7d", 7), ("30d", 30), ("inception", None)]
+INDICATOR_HELP = {
+    "model_return": (
+        "Total return on the model's *equity curve* over the window. "
+        "Includes realized P&L from closed positions, unrealized P&L on "
+        "open positions, and cash drag. This is the actual money the "
+        "account made or lost."
+    ),
+    "univ_n": (
+        "Number of stocks in the tradeable universe that had price data "
+        "for the full window. Stocks that IPO'd or delisted mid-window "
+        "are excluded so returns are comparable."
+    ),
+    "univ_mean": "Simple average of every universe stock's window return.",
+    "univ_median": (
+        "Middle value of universe returns. Less skewed by extreme outliers "
+        "than the mean — usually the better single-number summary of 'a "
+        "typical stock.'"
+    ),
+    "univ_std": "Standard deviation of universe returns — measures spread.",
+    "univ_pct_positive": "Share of the universe with a positive return over the window.",
+    "univ_pctile": (
+        "Where the model ranks within the universe distribution. 50 = beat "
+        "exactly half the stocks. 90 = top decile. 10 = bottom decile. "
+        "This is the 'how good was the pick relative to the alternatives' "
+        "number."
+    ),
+    "spy_return": "Buy-and-hold SPY return over the same window.",
+    "alpha_vs_median":
+        "Model return minus universe median — outperformance vs the typical stock.",
+    "alpha_vs_spy":
+        "Model return minus SPY — outperformance vs the broad market.",
+}
+
+
+# Universe-bars cache: one fetch covers all windows for the day.
+_universe_bars_cache: dict = {"start": None, "bars": None, "fetched_at": 0.0}
+_universe_bars_lock = threading.Lock()
+UNIV_BARS_TTL = 3600  # 1 hour — bars don't change intraday for 1Day timeframe
+
+
+def _alpaca_data_get(mc, path: str, params: dict, timeout: int = 30):
+    """Wrap a requests.get to Alpaca's market-data host using mc's keys."""
+    import requests as _requests
+    headers = {
+        "APCA-API-KEY-ID": mc.alpaca_key,
+        "APCA-API-SECRET-KEY": mc.alpaca_secret,
+    }
+    return _requests.get(
+        f"https://data.alpaca.markets/{path}",
+        headers=headers, params=params, timeout=timeout,
+    )
+
+
+def _fetch_bars_paged(mc, symbols: list, start_iso: str, logger=None) -> dict:
+    """Fetch daily bars for `symbols` since `start_iso`, batching to stay under
+    Alpaca's per-request symbol limit and paginating on `next_page_token`.
+
+    Returns {symbol: [bar, ...]} where each bar is the raw Alpaca dict (t/o/h/l/c/v).
+    Bars are returned chronologically per symbol.
+    """
+    out: dict = {}
+    BATCH = 180  # well under Alpaca's documented multi-symbol cap
+
+    for i in range(0, len(symbols), BATCH):
+        batch_syms = symbols[i:i + BATCH]
+        page_token = None
+        pages = 0
+        while True:
+            params = {
+                "symbols": ",".join(batch_syms),
+                "start": start_iso,
+                "timeframe": "1Day",
+                "limit": 10000,
+                "adjustment": "split",
+                "feed": "iex",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            try:
+                resp = _alpaca_data_get(mc, "v2/stocks/bars", params, timeout=30)
+            except Exception as e:
+                if logger:
+                    logger.warning(f"[PERF] universe bars batch {i}: {e}")
+                break
+            if resp.status_code != 200:
+                if logger:
+                    logger.warning(
+                        f"[PERF] universe bars batch {i}: HTTP {resp.status_code} "
+                        f"{resp.text[:200]}"
+                    )
+                break
+            data = resp.json()
+            for sym, blist in (data.get("bars") or {}).items():
+                if blist:
+                    out.setdefault(sym, []).extend(blist)
+            page_token = data.get("next_page_token")
+            pages += 1
+            if not page_token or pages > 10:
+                break
+    return out
+
+
+def _get_universe_bars(mc, syms: list, lookback_days: int, logger) -> dict:
+    """Get universe bars covering at least `lookback_days`, with caching."""
+    # Pad start a few days for weekends/holidays to ensure we have a bar
+    # before each window's nominal start.
+    start_dt = datetime.now() - timedelta(days=lookback_days + 5)
+    start_iso = start_dt.strftime("%Y-%m-%d")
+
+    with _universe_bars_lock:
+        cache = _universe_bars_cache
+        fresh = (
+            cache["bars"] is not None
+            and cache["start"] == start_iso
+            and time.time() - cache["fetched_at"] < UNIV_BARS_TTL
+        )
+        if fresh:
+            return cache["bars"]
+
+    # Fetch outside the lock — Alpaca calls take seconds. We accept the risk
+    # that two requests both fetch; the second will simply overwrite.
+    logger.info(
+        f"[PERF] Fetching universe bars: {len(syms)} symbols since {start_iso}"
+    )
+    t0 = time.time()
+    bars = _fetch_bars_paged(mc, syms, start_iso, logger=logger)
+    logger.info(
+        f"[PERF] Universe fetch: got bars for {len(bars)}/{len(syms)} symbols "
+        f"in {time.time() - t0:.1f}s"
+    )
+
+    with _universe_bars_lock:
+        _universe_bars_cache.update({
+            "start": start_iso, "bars": bars, "fetched_at": time.time(),
+        })
+    return bars
+
+
+def _bar_return_in_window(bars: list, window_start_ms: int) -> Optional[float]:
+    """% return for a symbol from the first bar at-or-after window_start_ms
+    to the most recent bar.  None if the symbol lacks data in the window."""
+    if not bars:
+        return None
+    # Bars are sorted by `t` (ISO string). Find first bar at or after the
+    # window start.
+    first = None
+    for b in bars:
+        try:
+            ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).timestamp() * 1000
+        except Exception:
+            continue
+        if ts >= window_start_ms:
+            first = b
+            break
+    if first is None:
+        return None
+    last = bars[-1]
+    try:
+        entry = float(first["o"])
+        exit_ = float(last["c"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    if entry <= 0:
+        return None
+    return (exit_ / entry - 1) * 100
+
+
+def _percentile_rank(value: float, distribution: list) -> Optional[float]:
+    """Return the percentile of `value` in `distribution` (0–100).
+    50 = beats half the distribution; 100 = beats every value."""
+    if not distribution:
+        return None
+    n_below = sum(1 for v in distribution if v < value)
+    return round(n_below / len(distribution) * 100, 1)
+
+
+def _model_return_for_window(equity: list, ts_ms: list, window_days: Optional[int]) -> Optional[float]:
+    """Compute the model's % return over a window from the equity curve."""
+    if not equity or len(equity) < 2 or len(ts_ms) != len(equity):
+        return None
+    if window_days is None:
+        # inception
+        start_eq = next((e for e in equity if e > 0), 0)
+        if start_eq <= 0:
+            return None
+        return (equity[-1] / start_eq - 1) * 100
+    cutoff_ms = (datetime.now() - timedelta(days=window_days)).timestamp() * 1000
+    # Find the equity snapshot at or just before the cutoff.
+    start_eq = None
+    for t, e in zip(ts_ms, equity):
+        if t <= cutoff_ms and e > 0:
+            start_eq = e
+        elif t > cutoff_ms:
+            break
+    # If the window predates the equity history, fall back to the first
+    # snapshot (effectively the inception return for shorter histories).
+    if start_eq is None:
+        start_eq = next((e for e in equity if e > 0), 0)
+    if start_eq is None or start_eq <= 0:
+        return None
+    return (equity[-1] / start_eq - 1) * 100
+
+
+def _window_start_ms(window_days: Optional[int], inception_ts_ms: Optional[int]) -> Optional[int]:
+    """Convert a window length to a start timestamp in milliseconds."""
+    if window_days is None:
+        return inception_ts_ms
+    return int((datetime.now() - timedelta(days=window_days)).timestamp() * 1000)
+
+
 def _compute_performance(model_name: str) -> dict:
-    """Compute model performance vs universe benchmark."""
+    """Compute model performance vs full tradeable universe across windows.
+
+    Headline metric: percentile rank of the model's equity-curve return in
+    the distribution of buy-and-hold returns across the entire tradeable
+    universe over the same window.
+    """
     logger = logging.getLogger("dashboard")
 
-    # Check cache
+    # Cache check
     with _perf_cache_lock:
         if model_name in _perf_cache:
             cached_data, cached_at = _perf_cache[model_name]
@@ -803,176 +1028,147 @@ def _compute_performance(model_name: str) -> dict:
     if not mc:
         return {"error": f"Model {model_name} not found"}
 
-    # 1) Get model positions from Alpaca
+    # 1) Model equity history (full available range so we can slice per window)
     try:
-        positions = pipeline.alpaca_request("GET", "v2/positions", mc, logger=logger)
-    except Exception as e:
-        return {"error": f"Failed to fetch positions: {e}"}
-
-    if not positions:
-        return {"error": "No positions", "model": model_name}
-
-    # Parse positions
-    model_positions = []
-    for p in positions:
-        model_positions.append({
-            "symbol": p["symbol"],
-            "avg_entry_price": float(p.get("avg_entry_price", 0)),
-            "current_price": float(p.get("current_price", 0)),
-            "market_value": float(p.get("market_value", 0)),
-            "cost_basis": float(p.get("cost_basis", 0)),
-            "unrealized_plpc": float(p.get("unrealized_plpc", 0)) * 100,
-            "qty": float(p.get("qty", 0)),
-        })
-
-    # Calculate model return (weighted by position size)
-    total_value = sum(pos["market_value"] for pos in model_positions)
-    total_cost = sum(pos["cost_basis"] for pos in model_positions)
-    if total_cost > 0:
-        model_return_pct = (total_value / total_cost - 1) * 100
-    else:
-        model_return_pct = 0.0
-
-    model_avg_return = np.mean([pos["unrealized_plpc"] for pos in model_positions])
-
-    # 2) Determine entry date from positions
-    # Use Alpaca orders to find the most recent batch entry date
-    try:
-        orders = pipeline.alpaca_request(
+        hist = pipeline.alpaca_request(
             "GET",
-            "v2/orders?status=filled&limit=200&direction=desc",
-            mc, logger=logger
+            "v2/account/portfolio/history?period=1A&timeframe=1D&extended_hours=false",
+            mc, logger=logger,
         )
-        # Find the earliest fill date among recent buy orders
-        fill_dates = []
-        for o in orders:
-            if o.get("side") == "buy" and o.get("filled_at"):
-                fill_dates.append(o["filled_at"][:10])  # YYYY-MM-DD
-        if fill_dates:
-            # Most orders fill on same day (rebalance); use the most common date
-            from collections import Counter
-            date_counts = Counter(fill_dates)
-            entry_date = date_counts.most_common(1)[0][0]
-        else:
-            entry_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-    except Exception:
-        entry_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+    except Exception as e:
+        return {"error": f"Failed to fetch portfolio history: {e}"}
 
-    # 3) Get universe symbols
+    timestamps = hist.get("timestamp") or []
+    equity = [float(e) for e in (hist.get("equity") or [])]
+    # Alpaca timestamps are seconds → milliseconds for consistency
+    ts_ms = [int(t) * 1000 for t in timestamps]
+
+    if len(equity) < 2:
+        return {"error": "Insufficient equity history (need ≥ 2 daily snapshots)", "model": model_name}
+
+    inception_ts_ms = ts_ms[0] if ts_ms else None
+
+    # 2) Current positions (for the held-positions table at the bottom)
+    try:
+        positions = pipeline.alpaca_request("GET", "v2/positions", mc, logger=logger) or []
+    except Exception:
+        positions = []
+    model_positions = [{
+        "symbol": p["symbol"],
+        "avg_entry_price": float(p.get("avg_entry_price", 0)),
+        "current_price":  float(p.get("current_price", 0)),
+        "market_value":   float(p.get("market_value", 0)),
+        "cost_basis":     float(p.get("cost_basis", 0)),
+        "unrealized_plpc": float(p.get("unrealized_plpc", 0)) * 100,
+        "qty":            float(p.get("qty", 0)),
+    } for p in positions]
+
+    # 3) Universe bars — one fetch covers every window. We're permissive
+    # with the symbol filter (just ASCII + reasonable length); Alpaca will
+    # silently omit tickers it can't price for the IEX feed and we drop
+    # those during stat aggregation.
     universe_syms = _get_universe_symbols()
-    if not universe_syms:
-        return {
-            "model": model_name,
-            "model_return_pct": round(model_return_pct, 2),
-            "model_avg_stock_return": round(model_avg_return, 2),
-            "positions": model_positions,
-            "entry_date": entry_date,
-            "error": "Could not load universe symbols",
+    universe_syms_clean = [
+        s for s in universe_syms
+        if s and s.isascii() and len(s) <= 8 and "/" not in s
+    ]
+
+    # Determine the longest lookback we need (max of finite windows; inception
+    # uses whatever the equity history covers).
+    finite_lookbacks = [days for _, days in PERF_WINDOWS if days is not None]
+    max_window = max(finite_lookbacks) if finite_lookbacks else 30
+    if inception_ts_ms is not None:
+        days_since_inception = max(
+            1, int((datetime.now().timestamp() * 1000 - inception_ts_ms) / 86_400_000)
+        )
+        max_window = max(max_window, days_since_inception)
+
+    universe_bars = _get_universe_bars(mc, universe_syms_clean, max_window, logger)
+
+    # SPY (separate single-symbol fetch — also cached implicitly inside the
+    # universe call when "SPY" happens to be in syms; usually it isn't).
+    spy_bars: list = []
+    try:
+        start_dt = datetime.now() - timedelta(days=max_window + 5)
+        resp = _alpaca_data_get(mc, "v2/stocks/SPY/bars", {
+            "start": start_dt.strftime("%Y-%m-%d"),
+            "timeframe": "1Day",
+            "limit": 10000,
+            "adjustment": "split",
+            "feed": "iex",
+        }, timeout=10)
+        if resp.status_code == 200:
+            spy_bars = resp.json().get("bars") or []
+    except Exception as e:
+        logger.warning(f"[PERF] SPY fetch: {e}")
+
+    # 4) Per-window stats
+    windows_out = {}
+    for label, days in PERF_WINDOWS:
+        win_start_ms = _window_start_ms(days, inception_ts_ms)
+        model_ret = _model_return_for_window(equity, ts_ms, days)
+
+        univ_returns = []
+        for sym, blist in universe_bars.items():
+            r = _bar_return_in_window(blist, win_start_ms)
+            if r is not None:
+                univ_returns.append(r)
+
+        spy_ret = _bar_return_in_window(spy_bars, win_start_ms) if spy_bars else None
+
+        if univ_returns:
+            mean_ = float(np.mean(univ_returns))
+            median_ = float(np.median(univ_returns))
+            std_ = float(np.std(univ_returns))
+            pct_pos = sum(1 for r in univ_returns if r > 0) / len(univ_returns) * 100
+            pctile = _percentile_rank(model_ret, univ_returns) if model_ret is not None else None
+        else:
+            mean_ = median_ = std_ = pct_pos = 0.0
+            pctile = None
+
+        windows_out[label] = {
+            "model_return":     None if model_ret is None else round(model_ret, 2),
+            "univ_n":           len(univ_returns),
+            "univ_mean":        round(mean_, 2),
+            "univ_median":      round(median_, 2),
+            "univ_std":         round(std_, 2),
+            "univ_pct_positive": round(pct_pos, 1),
+            "univ_pctile":      pctile,
+            "spy_return":       None if spy_ret is None else round(spy_ret, 2),
+            "alpha_vs_median":  None if model_ret is None else round(model_ret - median_, 2),
+            "alpha_vs_spy":     None if (model_ret is None or spy_ret is None) else round(model_ret - spy_ret, 2),
+            # A small bucketed histogram for the UI to draw without re-sending
+            # every return. 21 buckets between -20% and +20% (clipped).
+            "univ_histogram":   _bucket_returns(univ_returns) if univ_returns else None,
         }
 
-    # 4) Download SPY benchmark via Alpaca (no yfinance rate limits)
-    # Paper trading keys require feed=iex for market data access
-    logger.info(f"[PERF] Computing benchmark for {model_name} from {entry_date}")
-
-    import requests as _requests
-    _alpaca_data_headers = {
-        "APCA-API-KEY-ID": mc.alpaca_key,
-        "APCA-API-SECRET-KEY": mc.alpaca_secret,
-    }
-
-    spy_return = None
-    try:
-        resp = _requests.get(
-            "https://data.alpaca.markets/v2/stocks/SPY/bars",
-            headers=_alpaca_data_headers,
-            params={
-                "start": entry_date,
-                "timeframe": "1Day",
-                "limit": 30,
-                "adjustment": "split",
-                "feed": "iex",
-            },
-            timeout=10,
-        )
-        logger.info(f"[PERF] SPY API status={resp.status_code}")
-        if resp.status_code == 200:
-            bars = resp.json().get("bars", [])
-            if bars and len(bars) >= 1:
-                spy_entry = float(bars[0]["o"])  # open on entry date
-                spy_current = float(bars[-1]["c"])  # latest close
-                if spy_entry > 0:
-                    spy_return = (spy_current / spy_entry - 1) * 100
-                    logger.info(f"[PERF] SPY: entry={spy_entry}, current={spy_current}, return={spy_return:.2f}%")
-        else:
-            logger.warning(f"[PERF] SPY API error: {resp.status_code} {resp.text[:200]}")
-    except Exception as e:
-        logger.warning(f"[PERF] SPY benchmark failed: {e}")
-
-    # 5) Quick universe sample via Alpaca (50 random stocks)
-    universe_returns = []
-    if universe_syms:
-        import random
-        sample_size = min(50, len(universe_syms))
-        sample_syms = random.sample(universe_syms, sample_size)
-        # Filter out symbols with special chars (Alpaca won't recognize them)
-        sample_syms = [s for s in sample_syms if s.isalpha() and s.isascii()]
-        try:
-            resp = _requests.get(
-                "https://data.alpaca.markets/v2/stocks/bars",
-                headers=_alpaca_data_headers,
-                params={
-                    "symbols": ",".join(sample_syms),
-                    "start": entry_date,
-                    "timeframe": "1Day",
-                    "limit": 30,
-                    "adjustment": "split",
-                    "feed": "iex",
-                },
-                timeout=15,
-            )
-            logger.info(f"[PERF] Universe API status={resp.status_code}")
-            if resp.status_code == 200:
-                all_bars = resp.json().get("bars", {})
-                for sym, bars in all_bars.items():
-                    if len(bars) >= 1:
-                        entry_price = float(bars[0]["o"])
-                        current_price = float(bars[-1]["c"])
-                        if entry_price > 0:
-                            ret = (current_price / entry_price - 1) * 100
-                            universe_returns.append(ret)
-                logger.info(f"[PERF] Universe: {len(universe_returns)}/{len(sample_syms)} stocks returned data")
-            else:
-                logger.warning(f"[PERF] Universe API error: {resp.status_code} {resp.text[:200]}")
-        except Exception as e:
-            logger.warning(f"[PERF] Universe sample failed: {e}")
-
-    # 6) Build result
-    if universe_returns:
-        universe_avg = float(np.mean(universe_returns))
-        universe_median = float(np.median(universe_returns))
-        universe_std = float(np.std(universe_returns))
-        pct_positive = sum(1 for r in universe_returns if r > 0) / len(universe_returns) * 100
-    else:
-        universe_avg = universe_median = universe_std = pct_positive = 0.0
+    # 5) Pick the headline window — prefer "inception" if it has data.
+    headline_window = "inception"
+    headline = windows_out.get(headline_window) or {}
+    if headline.get("model_return") is None:
+        # Fall back to the longest window that does have data
+        for label in ("30d", "7d", "1d"):
+            if windows_out.get(label, {}).get("model_return") is not None:
+                headline_window = label
+                headline = windows_out[label]
+                break
 
     result = {
         "model": model_name,
-        "entry_date": entry_date,
+        "as_of": datetime.now().isoformat(timespec="seconds"),
         "n_positions": len(model_positions),
-        "model_return_pct": round(model_return_pct, 2),
-        "model_avg_stock_return": round(model_avg_return, 2),
-        "universe_n": len(universe_returns),
-        "universe_avg_return": round(universe_avg, 2),
-        "universe_median_return": round(universe_median, 2),
-        "universe_std": round(universe_std, 2),
-        "universe_pct_positive": round(pct_positive, 1),
-        "spy_return": round(spy_return, 2) if spy_return is not None else None,
-        "alpha_vs_universe": round(model_return_pct - universe_avg, 2) if universe_returns else None,
-        "alpha_vs_spy": round(model_return_pct - spy_return, 2) if spy_return is not None else None,
-        "positions": sorted(model_positions, key=lambda x: x["unrealized_plpc"], reverse=True),
+        "universe_size_total": len(universe_syms_clean),
+        "windows": windows_out,
+        "headline": {
+            "window":       headline_window,
+            "model_return": headline.get("model_return"),
+            "univ_pctile":  headline.get("univ_pctile"),
+            "univ_n":       headline.get("univ_n"),
+        },
+        "current_positions": sorted(model_positions, key=lambda x: x["unrealized_plpc"], reverse=True),
+        "indicator_help": INDICATOR_HELP,
     }
 
-    # Cache (cap at 50 entries to prevent unbounded growth)
     with _perf_cache_lock:
         _perf_cache[model_name] = (result, time.time())
         if len(_perf_cache) > 50:
@@ -982,12 +1178,30 @@ def _compute_performance(model_name: str) -> dict:
     return result
 
 
+def _bucket_returns(returns: list, lo: float = -20.0, hi: float = 20.0,
+                    n_buckets: int = 21) -> dict:
+    """Build a small histogram for the UI: returns clipped to [lo, hi]."""
+    width = (hi - lo) / n_buckets
+    counts = [0] * n_buckets
+    for r in returns:
+        idx = int((max(lo, min(hi - 1e-9, r)) - lo) / width)
+        idx = max(0, min(n_buckets - 1, idx))
+        counts[idx] += 1
+    return {
+        "lo": lo,
+        "hi": hi,
+        "width": width,
+        "counts": counts,
+        "total": len(returns),
+    }
+
+
 @app.route("/api/performance/<model_name>")
 def api_performance(model_name):
-    """Performance comparison: model vs universe benchmark."""
+    """Performance comparison: model vs universe across windows."""
     try:
         result = _compute_performance(model_name)
-        if "error" in result and "model_return_pct" not in result:
+        if "error" in result and "windows" not in result:
             return jsonify(result), 404 if "not found" in result.get("error", "") else 500
         return jsonify(result)
     except Exception as e:
@@ -2352,112 +2566,241 @@ def index():
         $(`sub-about-${{model}}`).innerHTML = html;
     }}
 
-    async function loadPerformance(model) {{
-        const container = $(`sub-performance-${{model}}`);
-        container.innerHTML = '<div class="card"><h2>Performance vs Universe</h2><p style="color:var(--text-dim)"><span class="spinner"></span> Computing benchmark (may take 30-60s on first load)...</p></div>';
+    // Track the active window per model so switching tabs doesn't reset.
+    const perfActiveWindow = {{}};
+    const PERF_WINDOW_LABELS = {{
+        '1d': 'Last day', '7d': 'Last 7 days', '30d': 'Last 30 days', 'inception': 'Since inception'
+    }};
+    const PERF_WINDOW_ORDER = ['1d', '7d', '30d', 'inception'];
 
-        const data = await api(`/api/performance/${{model}}`);
-        let html = '<div class="card"><h2>Performance vs Universe Benchmark</h2>';
+    function perfPctileNarrative(p, model, windowLabel) {{
+        if (p == null) return '';
+        const beat = p.toFixed(0);
+        const beneath = (100 - p).toFixed(0);
+        let tier = 'in the middle of';
+        if (p >= 90) tier = 'in the top 10% of';
+        else if (p >= 75) tier = 'in the top quartile of';
+        else if (p >= 50) tier = 'better than half of';
+        else if (p >= 25) tier = 'in the bottom half of';
+        else if (p >= 10) tier = 'in the bottom quartile of';
+        else tier = 'in the bottom 10% of';
+        return `${{model.toUpperCase()}} is ${{tier}} the universe over the ${{windowLabel.toLowerCase()}} — beating ${{beat}}% of stocks, behind ${{beneath}}%.`;
+    }}
 
-        if (!data || data.error) {{
-            html += `<p style="color:var(--red)">${{data ? data.error : 'Failed to fetch performance data'}}</p>`;
-            html += '</div>';
-            container.innerHTML = html;
-            return;
+    function perfPctileColor(p) {{
+        if (p == null) return 'var(--text-dim)';
+        if (p >= 75) return 'var(--green)';
+        if (p >= 50) return '#84cc16';        // lime
+        if (p >= 25) return 'var(--yellow)';
+        return 'var(--red)';
+    }}
+
+    function renderHistogram(hist, modelReturn) {{
+        if (!hist || !hist.counts) return '';
+        const max = Math.max(...hist.counts, 1);
+        const bars = hist.counts.map((c, i) => {{
+            const h = c / max * 70;  // px
+            const x = i / hist.counts.length * 100;
+            const w = 100 / hist.counts.length;
+            return `<div style="position:absolute;left:${{x}}%;width:calc(${{w}}% - 1px);
+                                bottom:0;height:${{h}}px;background:var(--card-border);
+                                border-radius:1px;"
+                         title="${{c}} stocks"></div>`;
+        }}).join('');
+        // Marker for the model's return
+        let marker = '';
+        if (modelReturn != null) {{
+            const clipped = Math.max(hist.lo, Math.min(hist.hi - 0.001, modelReturn));
+            const x = (clipped - hist.lo) / (hist.hi - hist.lo) * 100;
+            marker = `
+                <div style="position:absolute;left:${{x}}%;top:-4px;bottom:-4px;width:2px;
+                            background:var(--accent);transform:translateX(-1px);"></div>
+                <div style="position:absolute;left:${{x}}%;top:-22px;font-size:10px;
+                            color:var(--accent);font-weight:600;font-family:var(--mono);
+                            transform:translateX(-50%);white-space:nowrap;">
+                    ${{fmtPct(modelReturn)}}
+                </div>`;
         }}
+        return `
+            <div style="position:relative;height:90px;margin:24px 0 6px 0;border-bottom:1px solid var(--card-border);">
+                ${{bars}}${{marker}}
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-dim);font-family:var(--mono);">
+                <span>${{fmtPct(hist.lo)}}</span>
+                <span>0%</span>
+                <span>${{fmtPct(hist.hi)}}</span>
+            </div>
+            <p style="font-size:11px;color:var(--text-dim);margin:6px 0 0 0;text-align:center;">
+                Distribution of ${{hist.total}} universe-stock returns. Blue line = ${{modelReturn != null ? fmtPct(modelReturn) : '?'}} (model).
+            </p>`;
+    }}
 
-        // Summary metrics
-        const alphaColor = data.alpha_vs_universe >= 0 ? 'green' : 'red';
-        const modelColor = data.model_return_pct >= 0 ? 'green' : 'red';
-        const univColor = data.universe_avg_return >= 0 ? 'green' : 'red';
+    function renderPerfWindow(model, data, label) {{
+        const w = data.windows[label];
+        if (!w) return '<p style="color:var(--text-dim);">No data for this window.</p>';
 
-        html += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">
-            Entry date: <strong>${{data.entry_date}}</strong> &middot;
-            ${{data.n_positions}} positions &middot;
-            Universe: ${{data.universe_n}} stocks
-        </p>`;
+        const help = data.indicator_help || {{}};
+        const windowLabel = PERF_WINDOW_LABELS[label] || label;
+        const modelRet = w.model_return;
+        const pctile = w.univ_pctile;
+        const pctileColor = perfPctileColor(pctile);
 
-        html += '<div class="summary-row" style="margin-bottom:18px">';
-        html += `<div class="metric">
-            <div class="label">Model Return</div>
-            <div class="val ${{modelColor}}">${{fmtPct(data.model_return_pct)}}</div>
-            <div class="sub">Weighted portfolio return</div>
+        const helpRow = (k, value, valueClass) => `
+            <tr>
+                <td style="color:var(--text);"><strong>${{k.label}}</strong>
+                    <div style="font-size:11px;color:var(--text-dim);font-weight:400;line-height:1.4;margin-top:2px;">
+                        ${{k.help || ''}}
+                    </div>
+                </td>
+                <td class="text-right mono ${{valueClass || ''}}" style="vertical-align:top;font-size:14px;font-weight:600;white-space:nowrap;">
+                    ${{value}}
+                </td>
+            </tr>`;
+
+        let html = '';
+
+        // Hero — percentile rank (the headline number)
+        html += `<div style="background:linear-gradient(135deg, rgba(59,130,246,0.08), transparent);
+                              border:1px solid var(--card-border);border-radius:10px;
+                              padding:18px 22px;margin-bottom:18px;">
+            <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;">
+                ${{windowLabel}} — Percentile Rank
+            </div>
+            <div style="font-size:42px;font-weight:700;color:${{pctileColor}};font-family:var(--mono);
+                        line-height:1.1;margin:6px 0 4px 0;">
+                ${{pctile != null ? pctile.toFixed(0) + '<span style="font-size:22px;color:var(--text-dim);"> / 100</span>' : '—'}}
+            </div>
+            <div style="font-size:13px;color:var(--text);">
+                ${{perfPctileNarrative(pctile, model, windowLabel)}}
+            </div>
+            <div style="font-size:11px;color:var(--text-dim);margin-top:10px;">
+                Comparison universe: ${{w.univ_n}} stocks (out of ${{data.universe_size_total}} tradeable) — stocks without full price data for the window are excluded.
+            </div>
         </div>`;
-        html += `<div class="metric">
-            <div class="label">Universe Avg</div>
-            <div class="val ${{univColor}}">${{fmtPct(data.universe_avg_return)}}</div>
-            <div class="sub">${{data.universe_n}} stocks, ${{data.universe_pct_positive?.toFixed(0) || '?'}}% positive</div>
-        </div>`;
-        html += `<div class="metric">
-            <div class="label">Alpha vs Universe</div>
-            <div class="val ${{alphaColor}}">${{fmtPct(data.alpha_vs_universe)}}</div>
-            <div class="sub">Model picks vs random stock</div>
-        </div>`;
-        if (data.spy_return != null) {{
-            const spyColor = data.spy_return >= 0 ? 'green' : 'red';
-            const alphaSpyColor = data.alpha_vs_spy >= 0 ? 'green' : 'red';
-            html += `<div class="metric">
-                <div class="label">SPY Return</div>
-                <div class="val ${{spyColor}}">${{fmtPct(data.spy_return)}}</div>
-                <div class="sub">Alpha vs SPY: <span class="${{alphaSpyColor}}">${{fmtPct(data.alpha_vs_spy)}}</span></div>
-            </div>`;
+
+        // Comparison table with explanations
+        html += '<table style="width:100%;font-size:13px;">';
+        html += helpRow(
+            {{ label: `${{model.toUpperCase()}} return`, help: help.model_return }},
+            fmtPct(modelRet),
+            cls(modelRet)
+        );
+        html += helpRow(
+            {{ label: 'Universe median', help: help.univ_median }},
+            fmtPct(w.univ_median),
+            cls(w.univ_median)
+        );
+        html += helpRow(
+            {{ label: 'Universe mean', help: help.univ_mean }},
+            fmtPct(w.univ_mean),
+            cls(w.univ_mean)
+        );
+        if (w.spy_return != null) {{
+            html += helpRow(
+                {{ label: 'SPY return', help: help.spy_return }},
+                fmtPct(w.spy_return),
+                cls(w.spy_return)
+            );
         }}
-        html += '</div>';
-
-        // Comparison bar chart
-        html += '<div style="margin-bottom:18px">';
-        html += '<h3 style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Return Comparison</h3>';
-
-        const bars = [
-            {{ label: model.toUpperCase() + ' Portfolio', value: data.model_return_pct, color: '#3b82f6' }},
-            {{ label: 'Universe Average', value: data.universe_avg_return, color: '#6b7280' }},
-            {{ label: 'Universe Median', value: data.universe_median_return, color: '#4b5563' }},
-        ];
-        if (data.spy_return != null) {{
-            bars.push({{ label: 'SPY', value: data.spy_return, color: '#f59e0b' }});
+        html += helpRow(
+            {{ label: 'Alpha vs median', help: help.alpha_vs_median }},
+            fmtPct(w.alpha_vs_median),
+            cls(w.alpha_vs_median)
+        );
+        if (w.alpha_vs_spy != null) {{
+            html += helpRow(
+                {{ label: 'Alpha vs SPY', help: help.alpha_vs_spy }},
+                fmtPct(w.alpha_vs_spy),
+                cls(w.alpha_vs_spy)
+            );
         }}
+        html += helpRow(
+            {{ label: 'Universe % positive', help: help.univ_pct_positive }},
+            (w.univ_pct_positive != null ? w.univ_pct_positive.toFixed(0) + '%' : '—'),
+            ''
+        );
+        html += helpRow(
+            {{ label: 'Universe std dev', help: help.univ_std }},
+            (w.univ_std != null ? w.univ_std.toFixed(2) + '%' : '—'),
+            ''
+        );
+        html += '</table>';
 
-        const maxAbs = Math.max(...bars.map(b => Math.abs(b.value)), 0.01);
+        // Distribution histogram
+        html += `<h3 style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin:18px 0 0 0;">
+            Where ${{model.toUpperCase()}} sits in the universe distribution
+        </h3>`;
+        html += renderHistogram(w.univ_histogram, modelRet);
 
-        bars.forEach(bar => {{
-            const pct = Math.abs(bar.value) / maxAbs * 100;
-            const isPos = bar.value >= 0;
-            html += `<div style="display:flex;align-items:center;margin-bottom:6px">
-                <div style="width:120px;font-size:12px;color:var(--text-dim);flex-shrink:0">${{bar.label}}</div>
-                <div style="flex:1;height:22px;position:relative;display:flex;align-items:center">
-                    <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--card-border)"></div>
-                    <div style="position:absolute;${{isPos ? 'left:50%' : 'right:50%'}};height:18px;width:${{pct/2}}%;
-                               background:${{bar.color}};border-radius:${{isPos ? '0 4px 4px 0' : '4px 0 0 4px'}};
-                               min-width:2px"></div>
-                </div>
-                <div style="width:70px;text-align:right;font-family:var(--mono);font-size:12px;flex-shrink:0"
-                     class="${{bar.value >= 0 ? 'green' : 'red'}}">${{fmtPct(bar.value)}}</div>
-            </div>`;
+        return html;
+    }}
+
+    function renderPerfWindowTabs(model, data, activeLabel) {{
+        let html = '<div class="sub-tabs" style="margin:8px 0 16px 0;">';
+        PERF_WINDOW_ORDER.forEach(label => {{
+            const w = data.windows[label] || {{}};
+            const isActive = label === activeLabel;
+            const ret = w.model_return;
+            const retStr = ret != null ? fmtPct(ret) : '—';
+            const retCls = ret != null ? cls(ret) : '';
+            html += `<button class="sub-tab ${{isActive ? 'active' : ''}}"
+                             onclick="setPerfWindow('${{model}}','${{label}}')">
+                ${{PERF_WINDOW_LABELS[label]}}
+                <span style="font-size:10px;font-family:var(--mono);margin-left:4px;
+                             color:${{isActive ? '#fff' : 'var(--text-dim)'}};">
+                    ${{retStr}}
+                </span>
+            </button>`;
         }});
         html += '</div>';
+        return html;
+    }}
 
-        // Universe stats
-        html += `<div style="margin-bottom:18px">
-            <h3 style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Universe Statistics</h3>
-            <table>
-                <tr><td>Average return</td><td class="text-right mono ${{cls(data.universe_avg_return)}}">${{fmtPct(data.universe_avg_return)}}</td></tr>
-                <tr><td>Median return</td><td class="text-right mono ${{cls(data.universe_median_return)}}">${{fmtPct(data.universe_median_return)}}</td></tr>
-                <tr><td>Std deviation</td><td class="text-right mono">${{data.universe_std?.toFixed(2) || '-'}}%</td></tr>
-                <tr><td>% positive</td><td class="text-right mono">${{data.universe_pct_positive?.toFixed(0) || '-'}}%</td></tr>
-                <tr><td>Stocks analyzed</td><td class="text-right mono">${{data.universe_n}}</td></tr>
-            </table>
-        </div>`;
+    let _perfDataCache = {{}};
 
-        // Position returns table
-        if (data.positions && data.positions.length > 0) {{
-            html += '<h3 style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Position Returns (sorted by P&L %)</h3>';
-            html += `<table>
-                <tr><th>#</th><th>Symbol</th><th class="text-right">Entry</th>
-                    <th class="text-right">Current</th><th class="text-right">Value</th>
-                    <th class="text-right">Return</th></tr>`;
-            data.positions.forEach((p, i) => {{
+    function setPerfWindow(model, label) {{
+        perfActiveWindow[model] = label;
+        const data = _perfDataCache[model];
+        if (data) renderPerformanceCard(model, data);
+    }}
+
+    function renderPerformanceCard(model, data) {{
+        const container = $(`sub-performance-${{model}}`);
+        const activeLabel = perfActiveWindow[model] || data.headline?.window || 'inception';
+        perfActiveWindow[model] = activeLabel;
+
+        let html = '<div class="card">';
+        html += `<h2>Performance vs Universe</h2>`;
+        html += `<p style="font-size:12px;color:var(--text-dim);margin:-4px 0 4px 0;">
+            How the ${{model.toUpperCase()}} model's actual equity return compares to a buy-and-hold of every other stock in its tradeable universe.
+            <span style="display:block;margin-top:4px;color:var(--text-dim);font-size:11px;">
+                As of ${{data.as_of ? new Date(data.as_of).toLocaleString() : '?'}}.
+                Universe bars cached for 1 hour.
+            </span>
+        </p>`;
+
+        html += renderPerfWindowTabs(model, data, activeLabel);
+        html += renderPerfWindow(model, data, activeLabel);
+
+        // Held positions (de-emphasized footer)
+        const positions = data.current_positions || [];
+        if (positions.length > 0) {{
+            html += `<details style="margin-top:24px;">
+                <summary style="cursor:pointer;color:var(--text-dim);font-size:11px;
+                                text-transform:uppercase;letter-spacing:1px;
+                                padding:6px 0;">
+                    Currently held positions (${{positions.length}})
+                    <span style="text-transform:none;letter-spacing:0;font-size:11px;margin-left:6px;">
+                        — unrealized P&L on still-open trades; sub-window of total return
+                    </span>
+                </summary>
+                <table style="margin-top:8px;">
+                    <tr><th>#</th><th>Symbol</th><th class="text-right">Entry</th>
+                        <th class="text-right">Current</th><th class="text-right">Value</th>
+                        <th class="text-right">P&L</th></tr>`;
+            positions.forEach((p, i) => {{
                 html += `<tr>
-                    <td>${{i+1}}</td>
+                    <td>${{i + 1}}</td>
                     <td><strong>${{p.symbol}}</strong></td>
                     <td class="text-right mono">${{fmt$(p.avg_entry_price)}}</td>
                     <td class="text-right mono">${{fmt$(p.current_price)}}</td>
@@ -2465,11 +2808,26 @@ def index():
                     <td class="text-right mono ${{cls(p.unrealized_plpc)}}">${{fmtPct(p.unrealized_plpc)}}</td>
                 </tr>`;
             }});
-            html += '</table>';
+            html += '</table></details>';
         }}
 
         html += '</div>';
         container.innerHTML = html;
+    }}
+
+    async function loadPerformance(model) {{
+        const container = $(`sub-performance-${{model}}`);
+        container.innerHTML = '<div class="card"><h2>Performance vs Universe</h2><p style="color:var(--text-dim)"><span class="spinner"></span> Computing benchmark — fetching universe bars (10–60s on first load, cached 1h after).</p></div>';
+
+        const data = await api(`/api/performance/${{model}}`);
+        if (!data || (data.error && !data.windows)) {{
+            container.innerHTML = `<div class="card"><h2>Performance vs Universe</h2>
+                <p style="color:var(--red)">${{data ? data.error : 'Failed to fetch performance data'}}</p>
+                </div>`;
+            return;
+        }}
+        _perfDataCache[model] = data;
+        renderPerformanceCard(model, data);
     }}
 
     let allLogs = [];
