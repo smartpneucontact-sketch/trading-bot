@@ -2077,7 +2077,8 @@ def index():
             <h1>ML Trading Bot</h1>
             <p style="margin:2px 0 8px 0;color:var(--text-dim);font-size:13px;">by Arsen Khanguieldyan</p>
             <div class="meta">H{pipeline.HORIZON}_LongOnly{pipeline.TOP_N} &middot; Paper Trading &middot;
-                <span id="status-badge"></span> &middot; Auto-refresh 15s</div>
+                <span id="status-badge"></span> &middot; Auto-refresh 15s &middot;
+                <span id="header-clock" style="font-family:var(--mono);"></span></div>
         </div>
         <div class="actions">
             <button class="btn btn-primary" onclick="triggerRun(false)">Run All</button>
@@ -2184,6 +2185,51 @@ def index():
     const fmtPct = v => v == null ? '-' : (v >= 0 ? '+' : '') + Number(v).toFixed(2) + '%';
     const fmtN = (v, d=2) => v == null ? '-' : Number(v).toLocaleString('en-US', {{minimumFractionDigits:d, maximumFractionDigits:d}});
     const cls = v => v > 0 ? 'green' : v < 0 ? 'red' : '';
+
+    // ── Time formatting (always in ET) ────────────────────
+    // Accepts: ISO strings, Unix seconds, Unix milliseconds, JS Date.
+    function _toDate(input) {{
+        if (input == null || input === '') return null;
+        if (input instanceof Date) return isNaN(input) ? null : input;
+        if (typeof input === 'number') {{
+            // Heuristic: <1e12 means seconds, otherwise milliseconds
+            const ms = input < 1e12 ? input * 1000 : input;
+            const d = new Date(ms);
+            return isNaN(d) ? null : d;
+        }}
+        if (typeof input === 'string') {{
+            // Naive ISO without timezone? Treat as UTC so the conversion to
+            // ET is deterministic. Pipeline emits local ISO (no Z) for many
+            // fields — these are saved on Railway whose TZ is UTC.
+            const s = /[Z+]|[+-]\\d\\d:?\\d\\d$/.test(input) ? input : input + 'Z';
+            const d = new Date(s);
+            return isNaN(d) ? null : d;
+        }}
+        return null;
+    }}
+    const _ET_DATETIME = new Intl.DateTimeFormat('en-US', {{
+        timeZone: 'America/New_York', year: 'numeric', month: 'short', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+    }});
+    const _ET_TIME = new Intl.DateTimeFormat('en-US', {{
+        timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit',
+        second: '2-digit', hour12: false,
+    }});
+    const _ET_DATE = new Intl.DateTimeFormat('en-US', {{
+        timeZone: 'America/New_York', month: 'short', day: 'numeric',
+    }});
+    const _ET_DATE_FULL = new Intl.DateTimeFormat('en-US', {{
+        timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+    }});
+    function fmtET(input, opts) {{
+        const d = _toDate(input);
+        if (d == null) return '-';
+        const mode = (opts && opts.mode) || 'datetime';
+        if (mode === 'time') return _ET_TIME.format(d) + ' ET';
+        if (mode === 'date') return _ET_DATE.format(d);
+        if (mode === 'date-full') return _ET_DATE_FULL.format(d);
+        return _ET_DATETIME.format(d) + ' ET';
+    }}
 
     async function api(url) {{
         const r = await fetch(url);
@@ -2304,12 +2350,12 @@ def index():
             html += `
             <div class="metric">
                 <div class="label">Last Run</div>
-                <div class="val" style="font-size:16px">${{status.last_run_at ? status.last_run_at.slice(0,16) : 'Never'}}</div>
+                <div class="val" style="font-size:16px">${{status.last_run_at ? fmtET(status.last_run_at) : 'Never'}}</div>
                 <div class="sub">${{status.last_run_duration ? status.last_run_duration + 's' : ''}}</div>
             </div>
             <div class="metric">
                 <div class="label">Next Run</div>
-                <div class="val" style="font-size:16px">${{status.next_run_at ? status.next_run_at.slice(0,16) : '-'}}</div>
+                <div class="val" style="font-size:16px">${{status.next_run_at ? fmtET(status.next_run_at) : '-'}}</div>
                 <div class="sub">Total: ${{status.total_runs}} runs</div>
             </div>`;
 
@@ -2353,7 +2399,7 @@ def index():
         // Target portfolio card
         html += '<div class="card"><h2>Target Portfolio (Last Rebalance)</h2>';
         if (portfolio && portfolio.portfolio && portfolio.portfolio.length > 0) {{
-            html += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">${{portfolio.date ? portfolio.date.slice(0,16) : ''}}</p>`;
+            html += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">${{portfolio.date ? fmtET(portfolio.date) : ''}}</p>`;
             if (portfolio.regime_exposure != null) {{
                 html += `<p style="font-size:12px;margin-bottom:8px">Regime exposure: <strong>${{(portfolio.regime_exposure*100).toFixed(0)}}%</strong></p>`;
             }}
@@ -2439,10 +2485,7 @@ def index():
             return;
         }}
 
-        const labels = data.timestamps.map(ts => {{
-            const d = new Date(ts * 1000);
-            return d.toLocaleDateString('en-US', {{month:'short', day:'numeric'}});
-        }});
+        const labels = data.timestamps.map(ts => fmtET(ts, {{ mode: 'date' }}));
 
         const chartKey = `chart-${{model}}`;
         if (charts[chartKey]) charts[chartKey].destroy();
@@ -2521,8 +2564,7 @@ def index():
                 const action = t.trade_action || t.side || t.action || '-';
                 const actionCls = action.includes('buy') ? 'green' :
                                   action.includes('sell') ? 'red' : '';
-                const ts = t.timestamp || '';
-                const displayTs = ts.length > 16 ? ts.slice(0,10) + ' ' + ts.slice(11,16) : ts.slice(0,16);
+                const displayTs = fmtET(t.timestamp || '');
                 html += `<tr>
                     <td class="mono" style="font-size:11px">${{displayTs}}</td>
                     <td><strong>${{t.symbol || '-'}}</strong></td>
@@ -2554,8 +2596,7 @@ def index():
                 <tr><th>Time</th><th>Symbol</th><th>Trigger</th><th>Detail</th>
                     <th>Shares</th><th>Status</th><th>Source</th></tr>`;
             events.forEach(e => {{
-                const ts = e.timestamp || '';
-                const displayTs = ts.length > 16 ? ts.slice(0,10) + ' ' + ts.slice(11,16) : ts.slice(0,16);
+                const displayTs = fmtET(e.timestamp || '');
                 const triggerLabel = (e.trigger || '').replace('_', ' ').toUpperCase();
                 const triggerCls = e.trigger === 'portfolio_stop' ? 'red' :
                                    e.trigger === 'hard_stop' ? 'red' : 'yellow';
@@ -2588,7 +2629,7 @@ def index():
             html += `<table>
                 <tr><th>Date</th><th>Stocks</th><th>Sells</th><th>Buys</th></tr>`;
             modelData.history.slice().reverse().forEach(entry => {{
-                const date = (entry.date || '?').slice(0, 16);
+                const date = fmtET(entry.date || '');
                 const nStocks = (entry.target_symbols || []).length;
                 const result = entry.result || {{}};
                 html += `<tr>
@@ -2878,7 +2919,7 @@ def index():
         html += `<p style="font-size:12px;color:var(--text-dim);margin:-4px 0 4px 0;">
             How the ${{model.toUpperCase()}} model's actual equity return compares to a buy-and-hold of every other stock in its tradeable universe.
             <span style="display:block;margin-top:4px;color:var(--text-dim);font-size:11px;">
-                As of ${{data.as_of ? new Date(data.as_of).toLocaleString() : '?'}}.
+                As of ${{data.as_of ? fmtET(data.as_of) : '?'}}.
                 Universe bars cached for 1 hour.
             </span>
         </p>`;
@@ -3379,6 +3420,14 @@ def index():
     }}
 
     // ── Init ────────────────────────────────────────────
+    function tickClock() {{
+        const el = $('header-clock');
+        if (!el) return;
+        el.textContent = fmtET(new Date(), {{ mode: 'time' }});
+    }}
+    tickClock();
+    setInterval(tickClock, 1000);
+
     buildTabs();
     refreshAll();
     loadLogsList();

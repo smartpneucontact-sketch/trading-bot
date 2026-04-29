@@ -62,6 +62,44 @@ class StackedEnsemble:
             base_preds = self.meta_scaler.transform(base_preds)
         return self.meta_model.predict(base_preds)
 
+    def predict_with_base(self, X):
+        """Return (final_pred, base_preds_dict) for introspection."""
+        base_preds = {}
+        cols = []
+        for name, model in self.base_models:
+            preds = model.predict(X)
+            base_preds[name] = preds
+            cols.append(preds)
+        stacked = np.column_stack(cols)
+        if self.meta_scaler is not None:
+            stacked = self.meta_scaler.transform(stacked)
+        return self.meta_model.predict(stacked), base_preds
+
+    @property
+    def feature_importances_(self):
+        """Importance weighted by Ridge meta-learner absolute coefficients."""
+        coefs = np.abs(getattr(self.meta_model, "coef_", np.zeros(len(self.base_models))))
+        if coefs.sum() <= 0:
+            coefs = np.ones(len(self.base_models)) / len(self.base_models)
+        else:
+            coefs = coefs / coefs.sum()
+        imp = None
+        for (_, model), w in zip(self.base_models, coefs):
+            fi = getattr(model, "feature_importances_", None)
+            if fi is None:
+                continue
+            fi = np.asarray(fi, dtype=float)
+            imp = fi * w if imp is None else imp + fi * w
+        return imp
+
+    @property
+    def meta_weights(self):
+        coefs = getattr(self.meta_model, "coef_", None)
+        if coefs is None:
+            return {}
+        return {name: round(float(w), 4)
+                for (name, _), w in zip(self.base_models, coefs)}
+
 
 class EnsembleModel:
     """Weighted ensemble of sub-models (v5).
@@ -76,24 +114,41 @@ class EnsembleModel:
     def predict(self, X):
         total_weight = sum(w for _, _, w in self.models)
         preds = np.zeros(len(X))
-        for name, model, weight in self.models:
+        for _, model, weight in self.models:
             preds += model.predict(X) * weight
         return preds / total_weight
 
+    def predict_with_base(self, X):
+        """Return (final_pred, base_preds_dict)."""
+        base_preds = {}
+        total_weight = sum(w for _, _, w in self.models)
+        final = np.zeros(len(X))
+        for name, model, weight in self.models:
+            p = model.predict(X)
+            base_preds[name] = p
+            final += p * weight
+        return final / total_weight, base_preds
+
     @property
     def feature_importances_(self):
-        coefs = np.abs(self.meta_model.coef_)
-        coefs = coefs / coefs.sum()
-        imp = np.zeros_like(self.base_models[0][1].feature_importances_, dtype=float)
-        for i, (name, model) in enumerate(self.base_models):
-            if hasattr(model, 'feature_importances_'):
-                imp += model.feature_importances_ * coefs[i]
+        """Per-feature importance = weighted sum of sub-model importances."""
+        total_weight = sum(w for _, _, w in self.models) or 1.0
+        imp = None
+        for _, model, weight in self.models:
+            fi = getattr(model, "feature_importances_", None)
+            if fi is None:
+                continue
+            fi = np.asarray(fi, dtype=float)
+            scaled = fi * (weight / total_weight)
+            imp = scaled if imp is None else imp + scaled
         return imp
 
     @property
     def meta_weights(self):
-        return {name: round(float(w), 4)
-                for (name, _), w in zip(self.base_models, self.meta_model.coef_)}
+        """Map sub-model name to its (normalised) ensemble weight."""
+        total_weight = sum(w for _, _, w in self.models) or 1.0
+        return {name: round(float(w / total_weight), 4)
+                for name, _, w in self.models}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -122,10 +177,12 @@ MACRO_TICKERS = [
 
 MACRO_RENAME = {"^VIX": "VIX"}
 
-# Symbols excluded from trading (IPO too recent, data quality issues)
+# Symbols excluded from trading. Re-evaluate annually — names that have
+# accumulated 4+ years of post-IPO history can be removed. Kept here as a
+# safety net for the pipeline; not authoritative.
 EXCLUDED_SYMBOLS = {
-    "RIVN", "LCID", "PLTR", "HOOD", "AFRM", "IONQ", "JOBY",
-    "DNA", "GRAB", "NU", "RKLB", "VFS", "SMCI",
+    "VFS",   # very illiquid, halted often
+    "SMCI",  # data quality / restated financials
 }
 
 
@@ -356,7 +413,7 @@ def get_active_models() -> list[ModelConfig]:
     """
     config = load_model_config()
     models = []
-    config_has_keys = False
+    activated_via_config = False  # only True when at least one slot fully resolved
 
     # -- Try config file first --
     for slot in config.get("slots", []):
@@ -370,9 +427,6 @@ def get_active_models() -> list[ModelConfig]:
         key = slot.get("alpaca_key", "")
         secret = slot.get("alpaca_secret", "")
 
-        if key and secret:
-            config_has_keys = True
-
         model_path = _resolve_model_path(model_name)
         reg = MODEL_REGISTRY[model_name]
 
@@ -381,6 +435,7 @@ def get_active_models() -> list[ModelConfig]:
               f"model_file={model_path} exists={model_path.exists()}", flush=True)
 
         if key and secret and model_path.exists():
+            activated_via_config = True
             models.append(ModelConfig(
                 name=model_name,
                 model_path=model_path,
@@ -393,15 +448,22 @@ def get_active_models() -> list[ModelConfig]:
                 cutloss_portfolio_stop=slot.get("cutloss_portfolio_stop", -3.0),
             ))
 
-    # -- Fallback to env vars if config has no keys --
-    if not config_has_keys:
-        print("[MODEL DETECT] No keys in config file, falling back to env vars", flush=True)
-        env_models = [
-            ("v4", "MODEL_V4_ALPACA_KEY", "MODEL_V4_ALPACA_SECRET",
-             "ALPACA_API_KEY", "ALPACA_SECRET_KEY"),
-            ("v5", "MODEL_V5_ALPACA_KEY", "MODEL_V5_ALPACA_SECRET", None, None),
-            ("v6", "MODEL_V6_ALPACA_KEY", "MODEL_V6_ALPACA_SECRET", None, None),
-        ]
+    # -- Fallback to env vars if no slot in the config actually activated.
+    # We require an *activated* model — keys-but-no-pickle is treated like
+    # "config didn't work" so env vars get a chance.
+    if not activated_via_config:
+        print("[MODEL DETECT] No models activated from config; trying env vars", flush=True)
+        # Cover every model in MODEL_REGISTRY. Legacy ALPACA_API_KEY env vars
+        # are honored only for v4 (the original single-model setup).
+        env_models = []
+        for name in MODEL_REGISTRY:
+            env_models.append((
+                name,
+                f"MODEL_{name.upper()}_ALPACA_KEY",
+                f"MODEL_{name.upper()}_ALPACA_SECRET",
+                "ALPACA_API_KEY"    if name == "v4" else None,
+                "ALPACA_SECRET_KEY" if name == "v4" else None,
+            ))
         for name, key_env, secret_env, fallback_key, fallback_secret in env_models:
             key = os.environ.get(key_env, "")
             secret = os.environ.get(secret_env, "")
@@ -519,7 +581,22 @@ class TradeRecord:
 
 
 class TradeJournal:
-    """Persistent trade log — appends to JSON Lines + CSV files per model."""
+    """Persistent trade log — appends to JSON Lines + CSV files per model.
+
+    Concurrency: rebalance and cut-loss can run on different threads. A
+    single per-model lock makes appends atomic so neither file ends up
+    interleaved or with a half-written CSV header.
+    """
+
+    _locks: dict = {}
+    _locks_guard = threading.Lock()
+
+    @classmethod
+    def _lock_for(cls, model_name: str) -> threading.Lock:
+        with cls._locks_guard:
+            if model_name not in cls._locks:
+                cls._locks[model_name] = threading.Lock()
+            return cls._locks[model_name]
 
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -528,20 +605,21 @@ class TradeJournal:
         self.csv_path = TRADE_DIR / f"trades_{model_name}.csv"
 
     def log_trade(self, record: TradeRecord):
-        """Append a trade record to both JSONL and CSV."""
+        """Append a trade record to both JSONL and CSV (lock-protected)."""
         data = asdict(record)
 
-        # Append to JSONL (one JSON object per line — easy to parse)
-        with open(self.jsonl_path, "a") as f:
-            f.write(json.dumps(data, default=str) + "\n")
+        with self._lock_for(self.model_name):
+            # Append to JSONL (one JSON object per line — easy to parse)
+            with open(self.jsonl_path, "a") as f:
+                f.write(json.dumps(data, default=str) + "\n")
 
-        # Append to CSV (for spreadsheet analysis)
-        write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
-        with open(self.csv_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=data.keys())
-            if write_header:
-                writer.writeheader()
-            writer.writerow(data)
+            # Append to CSV (for spreadsheet analysis)
+            write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+            with open(self.csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=data.keys())
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(data)
 
     def get_trades(self, symbol: str = None, since: str = None) -> list[dict]:
         """Read trades back from the journal (for analysis endpoints)."""
@@ -736,16 +814,27 @@ def setup_logging(model_name: str = "main"):
 # DATA DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _wiki_read_html(url: str, logger) -> list:
-    """Read HTML tables from Wikipedia with proper User-Agent."""
+def _wiki_read_html(url: str, logger, max_attempts: int = 3) -> list:
+    """Read HTML tables from Wikipedia with retry + exponential backoff."""
     import requests as _req
     import io
     headers = {
         "User-Agent": "MLTradingBot/1.0 (educational paper trading project)"
     }
-    resp = _req.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return pd.read_html(io.StringIO(resp.text))
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = _req.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            return pd.read_html(io.StringIO(resp.text))
+        except Exception as e:
+            last_err = e
+            if attempt < max_attempts:
+                wait = 2 ** (attempt - 1)
+                logger.warning(f"  scrape attempt {attempt}/{max_attempts} failed for {url}: "
+                               f"{e} — retrying in {wait}s")
+                time.sleep(wait)
+    raise last_err
 
 
 # Symbol cache path — persists on Railway volume
@@ -759,7 +848,13 @@ def _load_symbol_cache(logger) -> list[str]:
             cache = json.loads(SYMBOL_CACHE_PATH.read_text())
             syms = cache.get("symbols", [])
             cached_at = cache.get("cached_at", "unknown")
-            logger.info(f"  Loaded {len(syms)} cached symbols (from {cached_at})")
+            try:
+                cached_dt = datetime.fromisoformat(cached_at)
+                age_days = (datetime.now() - cached_dt).days
+                logger.info(f"  Loaded {len(syms)} cached symbols "
+                            f"(from {cached_at}, {age_days}d old)")
+            except Exception:
+                logger.info(f"  Loaded {len(syms)} cached symbols (from {cached_at})")
             return syms
         except Exception as e:
             logger.warning(f"  Cache load failed: {e}")
@@ -878,38 +973,53 @@ def download_bars(symbols: list[str], days: int, logger,
         tickers_str = " ".join(batch)
         batch_start = time.time()
 
-        try:
-            df = yf.download(
-                tickers_str, start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-                group_by="ticker", auto_adjust=True, progress=False,
-                threads=True,
-            )
-            batch_ok = 0
-            for sym in batch:
-                try:
-                    if len(batch) == 1:
-                        sym_df = df.copy()
-                    else:
-                        sym_df = df[sym].copy()
-                    sym_df = _normalize_columns(sym_df)
-                    sym_df = sym_df.dropna(subset=["close"])
-                    if len(sym_df) >= MIN_HISTORY_DAYS:
-                        data[sym] = sym_df
-                        batch_ok += 1
-                    else:
-                        failed_syms.append(sym)
-                except Exception:
-                    failed_syms.append(sym)
+        df = None
+        last_err = None
+        for attempt in range(1, 3):  # 1 try + 1 retry
+            try:
+                df = yf.download(
+                    tickers_str, start=start.strftime("%Y-%m-%d"),
+                    end=end.strftime("%Y-%m-%d"),
+                    group_by="ticker", auto_adjust=True, progress=False,
+                    threads=True,
+                )
+                if df is not None and len(df) > 0:
+                    break
+                last_err = "empty dataframe"
+            except Exception as e:
+                last_err = e
+            if attempt < 2:
+                logger.warning(f"  Batch {batch_num}/{n_batches} attempt {attempt} "
+                               f"failed ({last_err}); retrying in 2s")
+                time.sleep(2)
 
-            batch_time = time.time() - batch_start
-            logger.info(f"  Batch {batch_num}/{n_batches}: "
-                        f"{batch_ok}/{len(batch)} ok ({batch_time:.1f}s)")
-
-        except Exception as e:
-            logger.warning(f"  Batch {batch_num}/{n_batches} FAILED: {e}")
-            report.add_warning(f"Stock batch {batch_num} failed: {e}")
+        if df is None or len(df) == 0:
+            logger.warning(f"  Batch {batch_num}/{n_batches} FAILED after retry: {last_err}")
+            report.add_warning(f"Stock batch {batch_num} failed: {last_err}")
             failed_syms.extend(batch)
+            time.sleep(0.3)
+            continue
+
+        batch_ok = 0
+        for sym in batch:
+            try:
+                if len(batch) == 1:
+                    sym_df = df.copy()
+                else:
+                    sym_df = df[sym].copy()
+                sym_df = _normalize_columns(sym_df)
+                sym_df = sym_df.dropna(subset=["close"])
+                if len(sym_df) >= MIN_HISTORY_DAYS:
+                    data[sym] = sym_df
+                    batch_ok += 1
+                else:
+                    failed_syms.append(sym)
+            except Exception:
+                failed_syms.append(sym)
+
+        batch_time = time.time() - batch_start
+        logger.info(f"  Batch {batch_num}/{n_batches}: "
+                    f"{batch_ok}/{len(batch)} ok ({batch_time:.1f}s)")
 
         time.sleep(0.3)
 
@@ -1448,17 +1558,29 @@ def _add_cross_sectional_ranks(
         else:
             cs_ranks[base_col] = series * 0 + 0.5  # neutral if only 1 stock
 
-    # Add cs_ features to each stock's row
+    # Add cs_ features to each stock's row. Drop stocks that lack the base
+    # value for any required cs_ feature — synthesising 0.5 for missing
+    # ranks would otherwise tell the model "this stock is median in every
+    # cross-sectional dimension" which is an opinionated fabrication.
     result = {}
+    dropped = []
     for sym in syms:
         row = latest_rows[sym].copy()
+        ok = True
         for cs_col, base_col in cs_to_base.items():
-            if base_col in cs_ranks and sym in cs_ranks[base_col].index:
-                row[cs_col] = np.float32(cs_ranks[base_col][sym])
-            else:
-                row[cs_col] = np.float32(0.5)  # neutral default
-        result[sym] = row
+            ranks = cs_ranks.get(base_col)
+            if ranks is None or sym not in ranks.index or pd.isna(ranks.get(sym)):
+                ok = False
+                break
+            row[cs_col] = np.float32(ranks[sym])
+        if ok:
+            result[sym] = row
+        else:
+            dropped.append(sym)
 
+    if dropped:
+        # Don't log every symbol; the caller will record the count.
+        result["__cs_dropped__"] = dropped  # surfaced once to the caller
     return result
 
 
@@ -1504,14 +1626,24 @@ def predict_rankings(
         logger.info(f"  Adding cross-sectional ranks across "
                     f"{len(latest_rows)} stocks...")
         latest_rows = _add_cross_sectional_ranks(latest_rows, feature_cols)
+        # Surface stocks dropped because they lacked CS inputs
+        dropped_cs = latest_rows.pop("__cs_dropped__", []) if isinstance(latest_rows, dict) else []
+        for sym in dropped_cs:
+            failures.append((sym, "missing cross-sectional inputs"))
+        if dropped_cs:
+            logger.info(f"  Dropped {len(dropped_cs)} stocks lacking CS inputs")
 
     # Step 3: Generate predictions
+    # Tightened thresholds: require ≥95% of features present and refuse to
+    # impute missing values — silently zero-filling a feature is better
+    # treated as "we don't have data, skip this stock."
+    MIN_FEATURE_COVERAGE = 0.95
     for sym, row_series in latest_rows.items():
         try:
             row = row_series.to_frame().T
             avail_cols = [c for c in feature_cols if c in row.columns]
 
-            if len(avail_cols) < len(feature_cols) * 0.9:
+            if len(avail_cols) < len(feature_cols) * MIN_FEATURE_COVERAGE:
                 missing_count = len(feature_cols) - len(avail_cols)
                 failures.append((sym, f"too many missing features "
                                f"({missing_count}/{len(feature_cols)})"))
@@ -1519,12 +1651,14 @@ def predict_rankings(
 
             row = row[avail_cols]
             if row.isna().any(axis=1).iloc[0]:
-                row = row.fillna(0)
+                # Drop the stock outright rather than impute zeros into
+                # features the model was trained on with real values.
+                nan_cols = [c for c in row.columns if row[c].isna().iloc[0]]
+                failures.append((sym, f"NaN in {len(nan_cols)} features"))
+                continue
 
-            # Ensure column order matches training
-            missing = [c for c in feature_cols if c not in row.columns]
-            for mc in missing:
-                row[mc] = 0
+            # Ensure column order matches training. Any column missing here
+            # was already caught by the coverage check above.
             row = row[feature_cols]
 
             pred = model.predict(row)[0]
@@ -1536,14 +1670,22 @@ def predict_rankings(
         except Exception as e:
             failures.append((sym, str(e)))
 
-    # Filter out symbols that Alpaca can't trade (class shares like CWEN-A,
-    # BRK.B, etc. with special characters in the ticker)
+    # Keep ASCII tickers and class shares (BRK-B, BF-B). Each gets converted
+    # to Alpaca's expected format (BRK.B) at order-placement time. We only
+    # drop genuinely malformed symbols (non-ASCII, slashes, more than one
+    # separator).
+    def _is_keepable(sym: str) -> bool:
+        if not sym or not sym.isascii() or "/" in sym or len(sym) > 8:
+            return False
+        cleaned = sym.replace("-", "").replace(".", "")
+        return cleaned.isalpha()
+
     tradeable_preds = {sym: pred for sym, pred in predictions.items()
-                       if sym.isalpha() and sym.isascii()}
+                       if _is_keepable(sym)}
     skipped = len(predictions) - len(tradeable_preds)
     if skipped > 0:
         logger.info(f"  Filtered {skipped} untradeable tickers "
-                    f"(special chars in symbol)")
+                    f"(non-ASCII / malformed)")
 
     ranked = sorted(tradeable_preds.items(), key=lambda x: x[1], reverse=True)
 
@@ -1603,7 +1745,7 @@ def _fetch_inactive_assets(symbols: list[str], mc: ModelConfig,
     checked = 0
     for sym in symbols[:check_count]:
         try:
-            url = f"{mc.alpaca_base_url}/v2/assets/{sym}"
+            url = f"{mc.alpaca_base_url}/v2/assets/{_to_alpaca_symbol(sym)}"
             resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200:
                 asset = resp.json()
@@ -1629,16 +1771,19 @@ def _fetch_inactive_assets(symbols: list[str], mc: ModelConfig,
 
 
 def _poll_order_status(order_id: str, mc: ModelConfig, logger,
-                       max_wait: float = 3.0, interval: float = 0.5) -> dict:
+                       max_wait: float = 8.0, interval: float = 0.5) -> dict:
     """Poll Alpaca for final order status (filled/rejected/etc).
 
-    Market orders usually fill within 1-2 seconds during market hours.
-    Returns the order dict with final status, filled_qty, filled_avg_price.
+    Most market orders fill in <1s but secondary-venue routing during
+    volatile minutes can take several seconds. We wait up to 8s before
+    giving up so the trade journal records real fill prices/quantities.
+    Polling backs off after the first 4 attempts to limit API calls.
     """
     import time as _time
     terminal_states = {"filled", "canceled", "expired", "rejected",
                        "suspended", "replaced"}
     elapsed = 0.0
+    attempts = 0
     while elapsed < max_wait:
         try:
             order = alpaca_request("GET", f"v2/orders/{order_id}", mc)
@@ -1647,13 +1792,34 @@ def _poll_order_status(order_id: str, mc: ModelConfig, logger,
                 return order
         except Exception:
             break
-        _time.sleep(interval)
-        elapsed += interval
+        attempts += 1
+        # 0.5s × 4 = 2s of fast polling, then 1s intervals up to 8s total
+        sleep_for = interval if attempts < 4 else max(interval, 1.0)
+        _time.sleep(sleep_for)
+        elapsed += sleep_for
     # Return whatever we have (may still be pending)
     try:
         return alpaca_request("GET", f"v2/orders/{order_id}", mc)
     except Exception:
         return {"status": "unknown", "id": order_id}
+
+
+def _to_alpaca_symbol(sym: str) -> str:
+    """Convert a yfinance-style class-share ticker (BRK-B) to Alpaca form (BRK.B).
+
+    The universe scrape stores symbols with dashes for yfinance compatibility;
+    Alpaca's trading and data APIs expect a dot. Pattern: ends with `-X`
+    where X is a single uppercase ASCII letter.
+    """
+    if (
+        len(sym) >= 3
+        and sym[-2] == "-"
+        and sym[-1].isascii()
+        and sym[-1].isalpha()
+        and sym[-1].isupper()
+    ):
+        return sym[:-2] + "." + sym[-1]
+    return sym
 
 
 def _make_alpaca_headers(mc: ModelConfig) -> dict:
@@ -1769,8 +1935,9 @@ def rebalance_portfolio(
     for rank_idx, (sym, pred) in enumerate(rankings):
         pred_lookup[sym] = (pred, rank_idx + 1)
 
-    # Generate a unique run_id for this rebalance cycle
-    run_id = f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    # Generate a unique run_id (microsecond precision avoids collisions when
+    # two clicks land in the same second, e.g. cron + manual trigger).
+    run_id = f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
 
     acct = get_account(mc, logger, report)
     portfolio_value = float(acct["portfolio_value"])
@@ -1952,9 +2119,10 @@ def rebalance_portfolio(
 
         try:
             order_ok = False
+            alpaca_sym = _to_alpaca_symbol(sym)
             if order["action"] == "sell":
                 # Close entire position
-                resp = alpaca_request("DELETE", f"v2/positions/{sym}", mc, logger=logger)
+                resp = alpaca_request("DELETE", f"v2/positions/{alpaca_sym}", mc, logger=logger)
                 # DELETE returns the closing order object (or empty on 204)
                 order_status = resp.get("status", "accepted") if resp else "accepted"
                 trade.order_id = resp.get("id") if resp else None
@@ -1975,7 +2143,7 @@ def rebalance_portfolio(
             elif order["action"] in ("buy_notional", "sell_notional"):
                 # Fractional notional order
                 resp = alpaca_request("POST", "v2/orders", mc, {
-                    "symbol": sym,
+                    "symbol": alpaca_sym,
                     "notional": round(order["notional"], 2),
                     "side": order["side"],
                     "type": "market",
@@ -2076,16 +2244,33 @@ def save_state(state: dict, mc: ModelConfig):
     mc.state_path.write_text(json.dumps(state, indent=2, default=str))
 
 
+def _trading_days_between(start: datetime, end: datetime) -> int:
+    """Count Mon–Fri days strictly between `start` and `end`.
+
+    Doesn't account for holidays — overshooting by a day on the rebalance
+    cadence is harmless. Same-day returns 0.
+    """
+    if end <= start:
+        return 0
+    days = 0
+    cur = start.date() + timedelta(days=1)
+    end_date = end.date()
+    while cur <= end_date:
+        if cur.weekday() < 5:
+            days += 1
+        cur = cur + timedelta(days=1)
+    return days
+
+
 def should_rebalance(state: dict, force: bool = False) -> bool:
-    """Check if we should rebalance today."""
+    """Check if we should rebalance today (HORIZON trading days since last)."""
     if force:
         return True
     last = state.get("last_rebalance")
     if last is None:
         return True
     last_date = datetime.fromisoformat(last)
-    days_since = (datetime.now() - last_date).days
-    return days_since >= HORIZON
+    return _trading_days_between(last_date, datetime.now()) >= HORIZON
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2233,19 +2418,36 @@ def run_single_model(
         feature_version=mc.feature_version,
     )
 
-    # Filter out inactive/untradeable assets (e.g. HOLX after delisting)
+    # Filter out inactive/untradeable assets (e.g. HOLX after delisting).
+    # Walk further down the ranking until we have at least TOP_N tradeable
+    # candidates so that a few delistings don't abort the rebalance.
     if not dry_run and mc.alpaca_key:
-        top_symbols = [sym for sym, _ in rankings[:TOP_N * 2]]
-        inactive = _fetch_inactive_assets(top_symbols, mc, logger)
-        if inactive:
-            rankings = [(sym, pred) for sym, pred in rankings if sym not in inactive]
-            report.set("inactive_assets_filtered", sorted(inactive))
+        all_inactive = set()
+        check_window = TOP_N * 2
+        max_window = min(len(rankings), TOP_N * 5)  # never check more than top 100
+        while True:
+            window_syms = [sym for sym, _ in rankings[:check_window]]
+            inactive = _fetch_inactive_assets(window_syms, mc, logger)
+            all_inactive.update(inactive)
+            tradeable_in_window = [s for s in window_syms if s not in all_inactive]
+            if len(tradeable_in_window) >= TOP_N or check_window >= max_window:
+                break
+            check_window = min(check_window + TOP_N, max_window)
+            logger.info(f"  Only {len(tradeable_in_window)}/{TOP_N} tradeable in top "
+                        f"{check_window - TOP_N}; extending check to top {check_window}")
+        if all_inactive:
+            rankings = [(sym, pred) for sym, pred in rankings if sym not in all_inactive]
+            report.set("inactive_assets_filtered", sorted(all_inactive))
 
     if len(rankings) < TOP_N:
         logger.error(f"Only {len(rankings)} predictions - need at least {TOP_N}")
         report.add_error(f"Insufficient predictions: {len(rankings)} < {TOP_N}")
         logger.info(report.format_summary())
         return
+
+    # Final guard: re-apply EXCLUDED_SYMBOLS in case anything slipped past
+    # the universe filter (e.g. a cached universe pre-dating an exclusion).
+    rankings = [(sym, p) for sym, p in rankings if sym not in EXCLUDED_SYMBOLS]
 
     target_symbols = [sym for sym, _ in rankings[:TOP_N]]
     report.set("target_portfolio", rankings[:TOP_N])
@@ -2339,10 +2541,24 @@ def run_single_model(
 
     # -- Step 5: Rebalance --
     logger.info("\n[5/5] REBALANCING PORTFOLIO")
-    result = rebalance_portfolio(
-        target_symbols, rankings, mc, journal, logger, report,
-        dry_run=dry_run, target_weights=tw,
-    )
+
+    # Avoid submitting `time_in_force=day` orders after market close — they
+    # would expire unfilled and leave the portfolio in a half-rebalanced
+    # state. Skip the trading step on closed days; predictions and history
+    # are still saved so the dashboard reflects the day's run.
+    if not dry_run and not _is_market_open():
+        logger.warning(
+            "  Market is closed (weekend, holiday, or outside 9:30–16:00 ET); "
+            "skipping order submission. Predictions saved; rebalance will "
+            "retry on the next scheduled run during market hours."
+        )
+        report.add_warning("Rebalance skipped: market closed")
+        result = {"dry_run": False, "skipped_market_closed": True}
+    else:
+        result = rebalance_portfolio(
+            target_symbols, rankings, mc, journal, logger, report,
+            dry_run=dry_run, target_weights=tw,
+        )
 
     # -- Save state --
     state["last_rebalance"] = datetime.now().isoformat()
@@ -2350,7 +2566,7 @@ def run_single_model(
     state["run_count"] = state.get("run_count", 0) + 1
     history_entry = {
         "date": datetime.now().isoformat(),
-        "run_id": f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
+        "run_id": f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}",
         "target_symbols": target_symbols,
         "predictions": {s: round(p, 4) for s, p in rankings[:TOP_N]},
         "result": {k: v for k, v in result.items()
@@ -2379,12 +2595,36 @@ def run_single_model(
 _cutloss_state_lock = threading.Lock()
 
 
-def _is_market_open() -> bool:
-    """Check if US stock market is currently open (simple time check)."""
+# Common NYSE/NASDAQ full-day closures. Add new years as they're announced.
+# Source: NYSE published holiday schedule (https://www.nyse.com/markets/hours-calendars).
+# Half-days are intentionally treated as full open — orders submitted within
+# 9:30–13:00 ET still fill normally.
+US_MARKET_HOLIDAYS = {
+    # 2025
+    "2025-01-01", "2025-01-09", "2025-01-20", "2025-02-17",
+    "2025-04-18", "2025-05-26", "2025-06-19", "2025-07-04",
+    "2025-09-01", "2025-11-27", "2025-12-25",
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26",
+    "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06",
+    "2027-11-25", "2027-12-24",
+}
+
+
+def _is_market_open(now: Optional[datetime] = None) -> bool:
+    """Return True if US equities are open at `now` (defaults to now in ET)."""
     from zoneinfo import ZoneInfo
-    now = datetime.now(ZoneInfo("America/New_York"))
-    # Market hours: 9:30 AM - 4:00 PM ET, Monday-Friday
+    if now is None:
+        now = datetime.now(ZoneInfo("America/New_York"))
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("America/New_York"))
     if now.weekday() >= 5:  # Saturday/Sunday
+        return False
+    if now.strftime("%Y-%m-%d") in US_MARKET_HOLIDAYS:
         return False
     market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -2752,7 +2992,7 @@ def _place_redistribute_buy(mc: ModelConfig, symbol: str, alloc: float,
                              journal, logger) -> int:
     """Place a single redistribution buy order. Returns 1 on success, 0 on failure."""
     order_data = {
-        "symbol": symbol,
+        "symbol": _to_alpaca_symbol(symbol),
         "notional": str(alloc),
         "side": "buy",
         "type": "market",
@@ -2809,28 +3049,27 @@ def _place_redistribute_buy(mc: ModelConfig, symbol: str, alloc: float,
 
 def _execute_cutloss_sell(mc: ModelConfig, symbol: str, qty: float,
                           reason: str, pct: float, logger):
-    """Execute a market sell order for a cut-loss trigger."""
+    """Execute a market sell to close a position triggered by a cut-loss rule.
+
+    Uses `DELETE /v2/positions/<symbol>` which closes the entire position
+    atomically — handles fractional shares cleanly and never half-fills.
+    """
     logger.info(f"[CUTLOSS] {mc.name}: SELLING {symbol} qty={qty:.2f} "
                 f"reason={reason} ({pct:.2f}%)")
 
-    order_data = {
-        "symbol": symbol,
-        "qty": str(qty),
-        "side": "sell",
-        "type": "market",
-        "time_in_force": "day",
-    }
-
+    alpaca_sym = _to_alpaca_symbol(symbol)
     try:
-        result = alpaca_request("POST", "v2/orders", mc, data=order_data, logger=logger)
+        result = alpaca_request(
+            "DELETE", f"v2/positions/{alpaca_sym}", mc, logger=logger,
+        ) or {}
         order_id = result.get("id", "?")
-        order_status = result.get("status", "submitted")
+        order_status = result.get("status", "accepted")
 
         if order_status in ("rejected", "canceled", "expired"):
-            logger.error(f"[CUTLOSS] {mc.name}: {symbol} sell order {order_status}: "
+            logger.error(f"[CUTLOSS] {mc.name}: {symbol} close order {order_status}: "
                          f"{result.get('reject_reason', 'unknown')}")
         else:
-            logger.info(f"[CUTLOSS] {mc.name}: {symbol} sell order placed: {order_id}, status={order_status}")
+            logger.info(f"[CUTLOSS] {mc.name}: {symbol} close order placed: {order_id}, status={order_status}")
 
         # Poll for final order status before journaling
         fill_price = None
