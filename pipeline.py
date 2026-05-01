@@ -2871,6 +2871,27 @@ def _redistribute_after_cutloss(mc: ModelConfig, sold_symbols: list[str],
         logger.error(f"[REDISTRIBUTE] {mc.name}: failed to fetch positions/account: {e}")
         return
 
+    # Skip-guard: if today's drawdown is already within 1 percentage point of
+    # the portfolio_stop trip threshold, redistributing more cash into the
+    # sinking portfolio is counterproductive — the next 60s scan will
+    # liquidate it anyway. The threshold is per-model so it scales with
+    # whatever cutloss_portfolio_stop is configured.
+    try:
+        current_eq = float(account.get("equity", 0))
+        last_eq = float(account.get("last_equity", 0))
+    except (TypeError, ValueError):
+        current_eq = last_eq = 0
+    if current_eq > 0 and last_eq > 0:
+        drawdown_pct = (current_eq / last_eq - 1) * 100
+        skip_threshold = mc.cutloss_portfolio_stop + 1.0  # e.g. -3.0 + 1.0 = -2.0
+        if drawdown_pct <= skip_threshold:
+            logger.warning(
+                f"[REDISTRIBUTE] {mc.name}: SKIPPED — daily drawdown {drawdown_pct:+.2f}% "
+                f"is within 1pp of portfolio_stop ({mc.cutloss_portfolio_stop:+.1f}%); "
+                f"funnelling cash into a sinking portfolio is counterproductive."
+            )
+            return
+
     # Calculate available cash to redistribute
     cash = float(account.get("cash", 0))
     buying_power = float(account.get("buying_power", 0))
