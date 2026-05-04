@@ -2761,8 +2761,13 @@ def _cutloss_scan_model(mc: ModelConfig, logger):
                 )
                 # Persist the trip flag BEFORE liquidating — a crash mid-sell
                 # must still block rebuys for the rest of the day.
+                # Also clear last_rebalance so should_rebalance() returns True
+                # on the next non-trip trading day; otherwise the model would
+                # sit in cash for the remainder of the original 5-day cadence
+                # even though it has no positions to manage.
                 state["portfolio_stop_tripped_date"] = today_iso
                 state["peak_prices"] = {}
+                state["last_rebalance"] = None
                 save_state(state, mc)
 
                 _liquidate_all(mc, positions, "portfolio_stop", logger)
