@@ -1214,14 +1214,24 @@ def compute_macro_features(macro_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
             lambda x: pd.Series(x).rank().iloc[-1] / len(x), raw=False
         )
 
+    # Emit features under BOTH `SP500_*` and `SPY_*` so models trained with
+    # either naming convention can find them at predict time. Older training
+    # scripts used `SP500_*`; newer ones use `SPY_*`. They're identical
+    # series (we read whichever ticker is present in macro_data).
     for name in ["SP500", "SPY"]:
         if name in macro_data:
             c = macro_data[name]["close"]
-            feats[f"{name}_ret5"] = c.pct_change(5) * 100
-            feats[f"{name}_ret20"] = c.pct_change(20) * 100
-            feats[f"{name}_sma50"] = (c - c.rolling(50).mean()) / (c.rolling(50).mean() + 1e-8) * 100
-            feats[f"{name}_sma200"] = (c - c.rolling(200).mean()) / (c.rolling(200).mean() + 1e-8) * 100
-            feats[f"{name}_vol20"] = c.pct_change().rolling(20).std() * np.sqrt(252)
+            ret5   = c.pct_change(5) * 100
+            ret20  = c.pct_change(20) * 100
+            sma50_ = (c - c.rolling(50).mean()) / (c.rolling(50).mean() + 1e-8) * 100
+            sma200 = (c - c.rolling(200).mean()) / (c.rolling(200).mean() + 1e-8) * 100
+            vol20  = c.pct_change().rolling(20).std() * np.sqrt(252)
+            for alias in ("SP500", "SPY"):
+                feats[f"{alias}_ret5"]   = ret5
+                feats[f"{alias}_ret20"]  = ret20
+                feats[f"{alias}_sma50"]  = sma50_
+                feats[f"{alias}_sma200"] = sma200
+                feats[f"{alias}_vol20"]  = vol20
             break
 
     if "TLT" in macro_data and "SHY" in macro_data:
@@ -1634,10 +1644,14 @@ def predict_rankings(
             logger.info(f"  Dropped {len(dropped_cs)} stocks lacking CS inputs")
 
     # Step 3: Generate predictions
-    # Tightened thresholds: require ≥95% of features present and refuse to
-    # impute missing values — silently zero-filling a feature is better
-    # treated as "we don't have data, skip this stock."
+    # Coverage gate: require ≥95% of features present per-stock. If a stock
+    # is missing a small handful of features (often macro-naming quirks
+    # that affect every stock identically — e.g. SP500_* vs SPY_*), zero
+    # those columns rather than skip the stock; macro features are constant
+    # across the cross-section, so a constant offset doesn't break ranking.
+    # NaN values inside present columns still drop the stock.
     MIN_FEATURE_COVERAGE = 0.95
+    missing_warned = False
     for sym, row_series in latest_rows.items():
         try:
             row = row_series.to_frame().T
@@ -1651,14 +1665,26 @@ def predict_rankings(
 
             row = row[avail_cols]
             if row.isna().any(axis=1).iloc[0]:
-                # Drop the stock outright rather than impute zeros into
-                # features the model was trained on with real values.
+                # NaN inside a feature that IS present — this is per-stock
+                # data quality. Drop instead of imputing.
                 nan_cols = [c for c in row.columns if row[c].isna().iloc[0]]
                 failures.append((sym, f"NaN in {len(nan_cols)} features"))
                 continue
 
-            # Ensure column order matches training. Any column missing here
-            # was already caught by the coverage check above.
+            # Fill any columns that are entirely absent (small numbers of
+            # macro features the training script named differently) so the
+            # model receives a row with the exact column order it expects.
+            absent = [c for c in feature_cols if c not in row.columns]
+            if absent:
+                if not missing_warned:
+                    logger.info(f"  Zero-filling {len(absent)} feature(s) absent "
+                                f"from live data: {absent[:8]}"
+                                + ("…" if len(absent) > 8 else ""))
+                    missing_warned = True
+                for col in absent:
+                    row[col] = 0.0
+
+            # Ensure column order matches training.
             row = row[feature_cols]
 
             pred = model.predict(row)[0]
