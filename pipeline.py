@@ -2587,7 +2587,16 @@ def run_single_model(
         )
 
     # -- Save state --
-    state["last_rebalance"] = datetime.now().isoformat()
+    # Only update last_rebalance if a rebalance actually happened. Skipping
+    # the order-submission step (market closed, dry_run) means no trades
+    # were placed; advancing last_rebalance would lock the model out of its
+    # next opportunity by making should_rebalance() think it just rebalanced.
+    rebalanced = not (
+        dry_run
+        or (isinstance(result, dict) and result.get("skipped_market_closed"))
+    )
+    if rebalanced:
+        state["last_rebalance"] = datetime.now().isoformat()
     state["last_run"] = datetime.now().isoformat()
     state["run_count"] = state.get("run_count", 0) + 1
     history_entry = {
