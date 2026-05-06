@@ -1123,11 +1123,17 @@ def _compute_performance(model_name: str) -> dict:
     if not mc:
         return {"error": f"Model {model_name} not found"}
 
-    # 1) Model equity history (full available range so we can slice per window)
+    # 1) Model equity history. We use period=all (not 1A) so Alpaca returns
+    # only the days the account has actually existed. With period=1A Alpaca
+    # pads pre-funding days with a synthetic $100k equity, which makes
+    # `inception_ts_ms = ts_ms[0]` point to ~1 year ago instead of the
+    # actual account-funded date — and then SPY / universe returns get
+    # measured over a full year while the model's return reflects only the
+    # real trading days, producing wildly inflated alphas at inception.
     try:
         hist = pipeline.alpaca_request(
             "GET",
-            "v2/account/portfolio/history?period=1A&timeframe=1D&extended_hours=false",
+            "v2/account/portfolio/history?period=all&timeframe=1D&extended_hours=false",
             mc, logger=logger,
         )
     except Exception as e:
