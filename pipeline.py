@@ -2785,32 +2785,69 @@ def _cutloss_scan_model(mc: ModelConfig, logger):
                 state_dirty = True
         start_equity = state.get("daily_portfolio_start", last_equity)
 
-        # ── Portfolio-level stop check ───────────────────────────
+        # ── Portfolio-level soft tiered scaler ───────────────────
+        # Three tiers anchored to the configured portfolio_stop:
+        #   Tier 1 (DD ≤ pstop):       scale to 60% exposure
+        #   Tier 2 (DD ≤ pstop·5/3):   scale to 30% exposure
+        #   Tier 3 (DD ≤ pstop·7/3):   liquidate to 0% + trip flag (hard stop)
+        # Replaces the prior single hard threshold that triggered repeatedly
+        # (2026-05-01, 2026-05-07) and forced sells at the worst intraday
+        # point. Tier 1/2 scale down pro-rata without setting the trip flag,
+        # so the model can re-enter on the next scheduled rebalance.
         if start_equity > 0 and current_equity > 0:
             daily_drawdown_pct = (current_equity / start_equity - 1) * 100
-            if daily_drawdown_pct <= mc.cutloss_portfolio_stop:
+            pstop = float(mc.cutloss_portfolio_stop)  # negative, e.g. -3.0
+
+            if daily_drawdown_pct <= pstop * (7.0 / 3.0):
+                # Tier 3 — hard liquidation, preserves original behavior.
                 logger.warning(
-                    f"[CUTLOSS] {mc.name}: PORTFOLIO STOP triggered! "
-                    f"Daily drawdown: {daily_drawdown_pct:.2f}% <= {mc.cutloss_portfolio_stop}%. "
-                    f"Liquidating ALL {n_positions} positions (equity=${current_equity:,.2f})."
+                    f"[CUTLOSS] {mc.name}: PORTFOLIO STOP TIER 3! "
+                    f"Daily drawdown: {daily_drawdown_pct:.2f}% <= "
+                    f"{pstop * 7.0 / 3.0:.2f}%. "
+                    f"Liquidating ALL {n_positions} positions "
+                    f"(equity=${current_equity:,.2f})."
                 )
-                # Persist the trip flag BEFORE liquidating — a crash mid-sell
-                # must still block rebuys for the rest of the day.
-                # Also clear last_rebalance so should_rebalance() returns True
-                # on the next non-trip trading day; otherwise the model would
-                # sit in cash for the remainder of the original 5-day cadence
-                # even though it has no positions to manage.
                 state["portfolio_stop_tripped_date"] = today_iso
                 state["peak_prices"] = {}
                 state["last_rebalance"] = None
                 save_state(state, mc)
-
                 _liquidate_all(mc, positions, "portfolio_stop", logger)
                 logger.warning(
-                    f"[CUTLOSS] {mc.name}: SUMMARY — liquidated all {n_positions} positions, "
-                    f"0/{n_positions} remaining, equity=${current_equity:,.2f}"
+                    f"[CUTLOSS] {mc.name}: SUMMARY — liquidated all "
+                    f"{n_positions} positions, 0/{n_positions} remaining, "
+                    f"equity=${current_equity:,.2f}"
                 )
                 return
+
+            elif daily_drawdown_pct <= pstop * (5.0 / 3.0):
+                # Tier 2 — scale to 30% gross exposure. No trip flag.
+                n_scaled = _soft_scale_portfolio(
+                    mc, positions, current_equity,
+                    target_exposure=0.30,
+                    tier="Tier2", dd_pct=daily_drawdown_pct, logger=logger,
+                )
+                logger.warning(
+                    f"[CUTLOSS] {mc.name}: SOFT SCALE TIER 2 — daily DD "
+                    f"{daily_drawdown_pct:+.2f}% <= {pstop * 5.0 / 3.0:+.2f}%; "
+                    f"scaled {n_scaled} positions pro-rata to 30% exposure. "
+                    f"Trip flag NOT set; trailing stops still active."
+                )
+                # Fall through — remaining trailing stops still apply.
+
+            elif daily_drawdown_pct <= pstop:
+                # Tier 1 — scale to 60% gross exposure. No trip flag.
+                n_scaled = _soft_scale_portfolio(
+                    mc, positions, current_equity,
+                    target_exposure=0.60,
+                    tier="Tier1", dd_pct=daily_drawdown_pct, logger=logger,
+                )
+                logger.warning(
+                    f"[CUTLOSS] {mc.name}: SOFT SCALE TIER 1 — daily DD "
+                    f"{daily_drawdown_pct:+.2f}% <= {pstop:+.2f}%; "
+                    f"scaled {n_scaled} positions pro-rata to 60% exposure. "
+                    f"Trip flag NOT set."
+                )
+                # Fall through — remaining trailing stops still apply.
 
         # ── Per-position stop checks ─────────────────────────────
         peak_prices = state.setdefault("peak_prices", {})
@@ -2911,11 +2948,11 @@ def _redistribute_after_cutloss(mc: ModelConfig, sold_symbols: list[str],
         logger.error(f"[REDISTRIBUTE] {mc.name}: failed to fetch positions/account: {e}")
         return
 
-    # Skip-guard: if today's drawdown is already within 1 percentage point of
-    # the portfolio_stop trip threshold, redistributing more cash into the
-    # sinking portfolio is counterproductive — the next 60s scan will
-    # liquidate it anyway. The threshold is per-model so it scales with
-    # whatever cutloss_portfolio_stop is configured.
+    # Skip-guard: if today's drawdown is already within 1.5 percentage points
+    # of the portfolio_stop trip threshold, redistributing more cash into the
+    # sinking portfolio is counterproductive — the next 60s scan will likely
+    # liquidate it anyway. Widened from 1.0pp to 1.5pp after the
+    # 2026-05-01 / 2026-05-07 cascades showed the brake firing too late.
     try:
         current_eq = float(account.get("equity", 0))
         last_eq = float(account.get("last_equity", 0))
@@ -2923,11 +2960,11 @@ def _redistribute_after_cutloss(mc: ModelConfig, sold_symbols: list[str],
         current_eq = last_eq = 0
     if current_eq > 0 and last_eq > 0:
         drawdown_pct = (current_eq / last_eq - 1) * 100
-        skip_threshold = mc.cutloss_portfolio_stop + 1.0  # e.g. -3.0 + 1.0 = -2.0
+        skip_threshold = mc.cutloss_portfolio_stop + 1.5  # e.g. -3.0 + 1.5 = -1.5
         if drawdown_pct <= skip_threshold:
             logger.warning(
                 f"[REDISTRIBUTE] {mc.name}: SKIPPED — daily drawdown {drawdown_pct:+.2f}% "
-                f"is within 1pp of portfolio_stop ({mc.cutloss_portfolio_stop:+.1f}%); "
+                f"is within 1.5pp of portfolio_stop ({mc.cutloss_portfolio_stop:+.1f}%); "
                 f"funnelling cash into a sinking portfolio is counterproductive."
             )
             return
@@ -3019,32 +3056,23 @@ def _redistribute_after_cutloss(mc: ModelConfig, sold_symbols: list[str],
     else:
         leftover = available
 
-    # Distribute leftover across existing positions proportionally
-    if leftover > 50 and positions:
-        remaining = []
-        total_mv = 0
-        for p in positions:
-            sym = p["symbol"]
-            if sym in sold_symbols:
-                continue
-            mv = float(p.get("market_value", 0))
-            if mv > 0:
-                remaining.append({"symbol": sym, "market_value": mv})
-                total_mv += mv
-
-        if remaining and total_mv > 0:
-            for pos in remaining:
-                sym = pos["symbol"]
-                weight = pos["market_value"] / total_mv
-                alloc = round(leftover * weight, 2)
-                if alloc < 5:
-                    continue
-                n_bought += _place_redistribute_buy(
-                    mc, sym, alloc, "topup", 0, journal, logger
-                )
+    # NOTE: the prior implementation topped up existing positions with any
+    # leftover cash here. That created a "redistribute death spiral" on
+    # falling days — sold position frees cash → top up survivors at higher
+    # cost basis → next survivor stops out → repeat — and triggered the
+    # PORTFOLIO STOP on v7+v8 multiple times (2026-05-01, 2026-05-07).
+    # Leftover cash is now deliberately held until the next scheduled
+    # rebalance. Replacement (above) is preserved because it's model-driven.
+    deployed = available - leftover
+    if leftover > 50:
+        logger.info(
+            f"[REDISTRIBUTE] {mc.name}: ${leftover:.2f} held as cash until next "
+            f"rebalance (topup-existing disabled to prevent procyclical averaging "
+            f"down on losers)."
+        )
 
     logger.info(f"[REDISTRIBUTE] {mc.name}: completed — {n_bought} buys placed, "
-                f"${available:.2f} redistributed, "
+                f"${deployed:.2f} deployed (${leftover:.2f} held cash), "
                 f"{n_held + len(replacements)}/{TOP_N} target positions")
 
 
@@ -3196,6 +3224,94 @@ def _liquidate_all(mc: ModelConfig, positions: list, reason: str, logger):
                 _execute_cutloss_sell(mc, sym, qty, reason, 0.0, logger)
             except Exception as e:
                 logger.error(f"[CUTLOSS] {mc.name}: failed to liquidate {sym}: {e}")
+
+
+def _soft_scale_portfolio(mc: ModelConfig, positions: list,
+                          current_equity: float, target_exposure: float,
+                          tier: str, dd_pct: float, logger) -> int:
+    """Scale gross exposure down to `target_exposure` of equity by selling
+    pro-rata across positions. Used by Tier 1 and Tier 2 of the soft
+    portfolio stop.
+
+    Each position is partial-sold using `notional` market orders so that
+    weights stay roughly proportional to entry weights (no "let the winners
+    run" bias against the model's intended portfolio shape).
+
+    Returns the count of positions partially-or-fully sold.
+    """
+    if not positions:
+        return 0
+    total_mv = sum(float(p.get("market_value", 0) or 0) for p in positions)
+    if total_mv <= 0:
+        return 0
+    target_mv = current_equity * target_exposure
+    excess_mv = total_mv - target_mv
+    if excess_mv <= 0:
+        return 0
+
+    fraction_to_sell = min(max(excess_mv / total_mv, 0.0), 1.0)
+    journal = TradeJournal(mc.name)
+    n_sold = 0
+    reason = f"soft_scale_{tier.lower()}"
+
+    for p in positions:
+        sym = p["symbol"]
+        mv = float(p.get("market_value", 0) or 0)
+        if mv <= 0:
+            continue
+        sell_notional = round(mv * fraction_to_sell, 2)
+        if sell_notional < 5.0:
+            continue  # skip dust slices
+        alpaca_sym = _to_alpaca_symbol(sym)
+        try:
+            resp = alpaca_request(
+                "POST", "v2/orders", mc,
+                data={
+                    "symbol": alpaca_sym,
+                    "notional": sell_notional,
+                    "side": "sell",
+                    "type": "market",
+                    "time_in_force": "day",
+                },
+                logger=logger,
+            ) or {}
+            status = resp.get("status", "submitted")
+            logger.info(
+                f"[CUTLOSS] {mc.name}: {tier} partial-sell {sym} "
+                f"${sell_notional:.2f} ({fraction_to_sell*100:.1f}% of "
+                f"position) reason={reason} status={status}"
+            )
+            try:
+                ts = datetime.now(timezone.utc)
+                journal.log_trade(TradeRecord(
+                    trade_id=f"{mc.name}_softscale_{ts.strftime('%Y%m%d_%H%M%S')}_{sym}",
+                    run_id=f"{mc.name}_softscale_{ts.strftime('%Y%m%d')}",
+                    model=mc.name,
+                    timestamp=ts.isoformat(),
+                    symbol=sym,
+                    side="sell",
+                    action=reason,
+                    order_type="market",
+                    time_in_force="day",
+                    notional_usd=sell_notional,
+                    order_id=resp.get("id"),
+                    order_status=status,
+                    current_price=float(p.get("current_price", 0) or 0),
+                ))
+            except Exception:
+                pass  # journal failure shouldn't block the sell
+            n_sold += 1
+        except Exception as e:
+            logger.error(
+                f"[CUTLOSS] {mc.name}: {tier} partial-sell failed for {sym}: {e}"
+            )
+
+    logger.info(
+        f"[CUTLOSS] {mc.name}: {tier} scaled {n_sold} positions pro-rata "
+        f"(sold ~{fraction_to_sell*100:.1f}% of each), DD was {dd_pct:+.2f}%, "
+        f"target_exposure={target_exposure*100:.0f}%."
+    )
+    return n_sold
 
 
 def run_pipeline(dry_run: bool = False, force: bool = False,
