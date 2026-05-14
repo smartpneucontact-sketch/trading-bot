@@ -56,7 +56,6 @@ from core.ensemble import StackedEnsemble, EnsembleModel  # noqa: E402
 
 TOP_N = 20              # Number of stocks to hold long
 HORIZON = 5             # Prediction horizon (trading days)
-MIN_HISTORY_DAYS = 250  # Minimum days of history needed for features
 LOOKBACK_DAYS = 300     # Days of history to download for feature computation
 
 # Persistent data dir (Railway volume)
@@ -67,22 +66,16 @@ BASE_DIR = Path(__file__).parent
 LOG_DIR = DATA_DIR / "logs"
 TRADE_DIR = DATA_DIR / "trades"
 
-# Macro tickers needed for features
-MACRO_TICKERS = [
-    "^VIX", "SPY", "QQQ", "IWM", "TLT", "SHY", "HYG",
-    "GLD", "USO", "UUP",
-    "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU",
-]
-
-MACRO_RENAME = {"^VIX": "VIX"}
-
-# Symbols excluded from trading. Re-evaluate annually — names that have
-# accumulated 4+ years of post-IPO history can be removed. Kept here as a
-# safety net for the pipeline; not authoritative.
-EXCLUDED_SYMBOLS = {
-    "VFS",   # very illiquid, halted often
-    "SMCI",  # data quality / restated financials
-}
+# Data download — see core/data.py + core/universe.py.
+from core.data import (  # noqa: E402
+    MACRO_TICKERS, MACRO_RENAME, MIN_HISTORY_DAYS,
+    _normalize_columns, download_bars, download_macro,
+)
+from core.universe import (  # noqa: E402
+    EXCLUDED_SYMBOLS, SYMBOL_CACHE_PATH,
+    _wiki_read_html, _load_symbol_cache, _save_symbol_cache,
+    get_tradeable_symbols,
+)
 
 
 # Multi-model config (ModelConfig + slot loaders + Alpaca key test) — see core/config.py.
@@ -136,278 +129,8 @@ def setup_logging(model_name: str = "main"):
     return logger, log_file
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA DOWNLOAD
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _wiki_read_html(url: str, logger, max_attempts: int = 3) -> list:
-    """Read HTML tables from Wikipedia with retry + exponential backoff."""
-    import requests as _req
-    import io
-    headers = {
-        "User-Agent": "MLTradingBot/1.0 (educational paper trading project)"
-    }
-    last_err = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = _req.get(url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            return pd.read_html(io.StringIO(resp.text))
-        except Exception as e:
-            last_err = e
-            if attempt < max_attempts:
-                wait = 2 ** (attempt - 1)
-                logger.warning(f"  scrape attempt {attempt}/{max_attempts} failed for {url}: "
-                               f"{e} — retrying in {wait}s")
-                time.sleep(wait)
-    raise last_err
-
-
-# Symbol cache path — persists on Railway volume
-SYMBOL_CACHE_PATH = DATA_DIR / "universe_cache.json"
-
-
-def _load_symbol_cache(logger) -> list[str]:
-    """Load cached symbol list from last successful scrape."""
-    if SYMBOL_CACHE_PATH.exists():
-        try:
-            cache = json.loads(SYMBOL_CACHE_PATH.read_text())
-            syms = cache.get("symbols", [])
-            cached_at = cache.get("cached_at", "unknown")
-            try:
-                cached_dt = datetime.fromisoformat(cached_at)
-                age_days = (datetime.now() - cached_dt).days
-                logger.info(f"  Loaded {len(syms)} cached symbols "
-                            f"(from {cached_at}, {age_days}d old)")
-            except Exception:
-                logger.info(f"  Loaded {len(syms)} cached symbols (from {cached_at})")
-            return syms
-        except Exception as e:
-            logger.warning(f"  Cache load failed: {e}")
-    return []
-
-
-def _save_symbol_cache(symbols: list[str], logger):
-    """Save symbol list to cache for fallback."""
-    try:
-        SYMBOL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SYMBOL_CACHE_PATH.write_text(json.dumps({
-            "symbols": symbols,
-            "cached_at": datetime.now().isoformat(),
-            "count": len(symbols),
-        }, indent=2))
-        logger.info(f"  Saved {len(symbols)} symbols to cache")
-    except Exception as e:
-        logger.warning(f"  Cache save failed: {e}")
-
-
-def get_tradeable_symbols(logger, report: RunReport) -> list[str]:
-    """Get S&P 500 + Nasdaq 100 + Russell 1000 symbols from Wikipedia.
-
-    Uses proper User-Agent to avoid 403 blocks. Falls back to cached
-    symbol list if all scrapes fail.
-    """
-    report.start_step("get_universe")
-    sp500, ndx_syms, russell_syms = [], [], []
-
-    try:
-        tables = _wiki_read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", logger
-        )
-        sp500 = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        logger.info(f"  S&P 500: {len(sp500)} symbols from Wikipedia")
-    except Exception as e:
-        logger.warning(f"  S&P 500 scrape failed: {e}")
-        report.add_warning(f"S&P 500 scrape failed: {e}")
-
-    try:
-        ndx = _wiki_read_html(
-            "https://en.wikipedia.org/wiki/Nasdaq-100", logger
-        )
-        for table in ndx:
-            if "Ticker" in table.columns:
-                ndx_syms = table["Ticker"].str.replace(".", "-", regex=False).tolist()
-                break
-            elif "Symbol" in table.columns:
-                ndx_syms = table["Symbol"].str.replace(".", "-", regex=False).tolist()
-                break
-        logger.info(f"  Nasdaq 100: {len(ndx_syms)} symbols from Wikipedia")
-    except Exception as e:
-        logger.warning(f"  Nasdaq 100 scrape failed: {e}")
-        report.add_warning(f"Nasdaq 100 scrape failed: {e}")
-
-    # Russell 1000 — adds ~400-500 mid-cap stocks not in S&P 500
-    try:
-        r1k_tables = _wiki_read_html(
-            "https://en.wikipedia.org/wiki/Russell_1000_Index", logger
-        )
-        for table in r1k_tables:
-            if "Ticker" in table.columns:
-                russell_syms = table["Ticker"].str.replace(".", "-", regex=False).tolist()
-                break
-            elif "Symbol" in table.columns:
-                russell_syms = table["Symbol"].str.replace(".", "-", regex=False).tolist()
-                break
-        logger.info(f"  Russell 1000: {len(russell_syms)} symbols from Wikipedia")
-    except Exception as e:
-        logger.warning(f"  Russell 1000 scrape failed (non-critical): {e}")
-        report.add_warning(f"Russell 1000 scrape failed: {e}")
-
-    all_syms = sorted(set(sp500 + ndx_syms + russell_syms) - EXCLUDED_SYMBOLS)
-
-    # If scraping failed completely, fall back to cache
-    if not all_syms:
-        logger.warning("  All scrapes failed — falling back to cached symbol list")
-        all_syms = _load_symbol_cache(logger)
-    else:
-        # Save successful scrape to cache
-        _save_symbol_cache(all_syms, logger)
-
-    logger.info(f"  Total universe: {len(all_syms)} unique symbols "
-                f"(excluded {len(EXCLUDED_SYMBOLS)} blacklisted)")
-    report.set("universe_size", len(all_syms))
-    report.end_step("get_universe")
-    return all_syms
-
-
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize yfinance column names (handles MultiIndex from newer versions)."""
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    df.columns = [str(c).lower().strip() for c in df.columns]
-    return df
-
-
-def download_bars(symbols: list[str], days: int, logger,
-                  report: RunReport) -> dict[str, pd.DataFrame]:
-    """Download recent daily bars from Yahoo Finance."""
-    report.start_step("download_stocks")
-    end = datetime.now()
-    start = end - timedelta(days=int(days * 1.5))
-
-    logger.info(f"  Date range: {start.date()} -> {end.date()}")
-    logger.info(f"  Symbols to download: {len(symbols)}")
-
-    data = {}
-    failed_syms = []
-    batch_size = 50
-    n_batches = (len(symbols) + batch_size - 1) // batch_size
-
-    for batch_idx in range(0, len(symbols), batch_size):
-        batch_num = batch_idx // batch_size + 1
-        batch = symbols[batch_idx:batch_idx + batch_size]
-        tickers_str = " ".join(batch)
-        batch_start = time.time()
-
-        df = None
-        last_err = None
-        for attempt in range(1, 3):  # 1 try + 1 retry
-            try:
-                df = yf.download(
-                    tickers_str, start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"),
-                    group_by="ticker", auto_adjust=True, progress=False,
-                    threads=True,
-                )
-                if df is not None and len(df) > 0:
-                    break
-                last_err = "empty dataframe"
-            except Exception as e:
-                last_err = e
-            if attempt < 2:
-                logger.warning(f"  Batch {batch_num}/{n_batches} attempt {attempt} "
-                               f"failed ({last_err}); retrying in 2s")
-                time.sleep(2)
-
-        if df is None or len(df) == 0:
-            logger.warning(f"  Batch {batch_num}/{n_batches} FAILED after retry: {last_err}")
-            report.add_warning(f"Stock batch {batch_num} failed: {last_err}")
-            failed_syms.extend(batch)
-            time.sleep(0.3)
-            continue
-
-        batch_ok = 0
-        for sym in batch:
-            try:
-                if len(batch) == 1:
-                    sym_df = df.copy()
-                else:
-                    sym_df = df[sym].copy()
-                sym_df = _normalize_columns(sym_df)
-                sym_df = sym_df.dropna(subset=["close"])
-                if len(sym_df) >= MIN_HISTORY_DAYS:
-                    data[sym] = sym_df
-                    batch_ok += 1
-                else:
-                    failed_syms.append(sym)
-            except Exception:
-                failed_syms.append(sym)
-
-        batch_time = time.time() - batch_start
-        logger.info(f"  Batch {batch_num}/{n_batches}: "
-                    f"{batch_ok}/{len(batch)} ok ({batch_time:.1f}s)")
-
-        time.sleep(0.3)
-
-    logger.info(f"  Downloaded: {len(data)} symbols, "
-                f"failed: {len(failed_syms)} symbols")
-
-    if data:
-        sample_sym = next(iter(data))
-        sample_df = data[sample_sym]
-        logger.info(f"  Sample ({sample_sym}): {len(sample_df)} days, "
-                    f"{sample_df.index[0].date()} -> {sample_df.index[-1].date()}")
-        report.set("latest_data_date", str(sample_df.index[-1].date()))
-
-    report.set("stocks_downloaded", len(data))
-    report.set("stocks_failed", len(failed_syms))
-    if failed_syms and len(failed_syms) <= 20:
-        report.add_warning(f"Failed stocks: {', '.join(failed_syms)}")
-    report.end_step("download_stocks")
-    return data
-
-
-def download_macro(days: int, logger, report: RunReport) -> dict[str, pd.DataFrame]:
-    """Download macro tickers."""
-    report.start_step("download_macro")
-    end = datetime.now()
-    start = end - timedelta(days=int(days * 1.5))
-
-    macro = {}
-    missing = []
-
-    for ticker in MACRO_TICKERS:
-        try:
-            df = yf.download(
-                ticker, start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-                auto_adjust=True, progress=False,
-            )
-            df = _normalize_columns(df)
-            name = MACRO_RENAME.get(ticker, ticker)
-            df_clean = df.dropna(subset=["close"])
-            if len(df_clean) > 0:
-                macro[name] = df_clean
-                logger.info(f"  {name:6s}: {len(df_clean)} days, "
-                            f"latest close: {df_clean['close'].iloc[-1]:.2f}")
-            else:
-                missing.append(ticker)
-                logger.warning(f"  {ticker}: no data returned")
-        except Exception as e:
-            missing.append(ticker)
-            logger.warning(f"  {ticker}: FAILED - {e}")
-            report.add_warning(f"Macro {ticker} failed: {e}")
-        time.sleep(0.1)
-
-    logger.info(f"  Macro: {len(macro)}/{len(MACRO_TICKERS)} downloaded")
-    if missing:
-        logger.warning(f"  Missing: {', '.join(missing)}")
-
-    report.set("macro_downloaded", len(macro))
-    report.set("macro_total", len(MACRO_TICKERS))
-    report.set("macro_missing", missing)
-    report.end_step("download_macro")
-    return macro
+# Universe scraping (Wikipedia) + bar/macro download via yfinance now live
+# in core/universe.py and core/data.py (imported above).
 
 
 # ═══════════════════════════════════════════════════════════════════════════
