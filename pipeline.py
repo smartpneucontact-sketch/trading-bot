@@ -1910,51 +1910,17 @@ def rebalance_portfolio(
     return rb_data
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STATE MANAGEMENT (per-model)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def load_state(mc: ModelConfig) -> dict:
-    """Load pipeline state from JSON for a specific model."""
-    mc.state_path.parent.mkdir(parents=True, exist_ok=True)
-    if mc.state_path.exists():
-        return json.loads(mc.state_path.read_text())
-    return {"last_rebalance": None, "last_run": None, "run_count": 0, "history": []}
-
-
-def save_state(state: dict, mc: ModelConfig):
-    """Save pipeline state to JSON for a specific model."""
-    mc.state_path.parent.mkdir(parents=True, exist_ok=True)
-    mc.state_path.write_text(json.dumps(state, indent=2, default=str))
-
-
-def _trading_days_between(start: datetime, end: datetime) -> int:
-    """Count Mon–Fri days strictly between `start` and `end`.
-
-    Doesn't account for holidays — overshooting by a day on the rebalance
-    cadence is harmless. Same-day returns 0.
-    """
-    if end <= start:
-        return 0
-    days = 0
-    cur = start.date() + timedelta(days=1)
-    end_date = end.date()
-    while cur <= end_date:
-        if cur.weekday() < 5:
-            days += 1
-        cur = cur + timedelta(days=1)
-    return days
+# State management — see core/state.py.
+from core.state import (  # noqa: E402
+    load_state, save_state,
+    trading_days_between as _trading_days_between,
+    should_rebalance as _core_should_rebalance,
+)
 
 
 def should_rebalance(state: dict, force: bool = False) -> bool:
-    """Check if we should rebalance today (HORIZON trading days since last)."""
-    if force:
-        return True
-    last = state.get("last_rebalance")
-    if last is None:
-        return True
-    last_date = datetime.fromisoformat(last)
-    return _trading_days_between(last_date, datetime.now()) >= HORIZON
+    """Thin wrapper that injects the pipeline-level HORIZON constant."""
+    return _core_should_rebalance(state, horizon_days=HORIZON, force=force)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
