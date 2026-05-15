@@ -370,7 +370,11 @@ def _load_trades_merged(model_name: str, limit: int = 50) -> list:
     return merged[:limit]
 
 
-CUTLOSS_ACTIONS = {"hard_stop", "trailing_stop", "portfolio_stop"}
+CUTLOSS_ACTIONS = {
+    "hard_stop", "trailing_stop", "portfolio_stop",
+    # Phase 1 soft tiered portfolio stop (partial sells at Tier 1 / Tier 2)
+    "soft_scale_tier1", "soft_scale_tier2",
+}
 
 
 def _load_cutloss_events(model_name: str, limit: int = 100) -> list:
@@ -741,6 +745,119 @@ def api_cutloss(model_name):
         limit = 100
     events = _load_cutloss_events(model_name, limit)
     return jsonify(events)
+
+
+# Trigger labels grouped by mechanism — Phase 1 added the soft tiered stop,
+# so the dashboard now distinguishes per-position stops, soft scaling,
+# and full liquidations.
+_PER_POSITION_TRIGGERS = {"hard_stop", "trailing_stop"}
+_SOFT_SCALE_TRIGGERS = {"soft_scale_tier1", "soft_scale_tier2"}
+_PORTFOLIO_STOP_TRIGGERS = {"portfolio_stop"}
+
+
+@app.route("/api/cutloss-stats/<model_name>")
+def api_cutloss_stats(model_name):
+    """Aggregate cutloss activity stats — events today / 7d / 30d.
+
+    Reads the trade journal directly (more reliable than parsing logs)
+    and produces counts + notional per window, broken down by trigger
+    type (per-position stops vs soft-scale partial sells vs full
+    portfolio liquidation).
+    """
+    if not _validate_model_name(model_name):
+        return jsonify({"error": "invalid model"}), 400
+
+    journal_path = TRADE_DIR / f"trades_{model_name}.jsonl"
+    now = datetime.now()
+    cutoffs = {
+        "today":  now.replace(hour=0, minute=0, second=0, microsecond=0),
+        "last_7d":  now - timedelta(days=7),
+        "last_30d": now - timedelta(days=30),
+    }
+
+    def _empty_window() -> dict:
+        return {
+            "events": 0,
+            "notional": 0.0,
+            "per_position_stops": 0,
+            "soft_scale_partials": 0,
+            "portfolio_stops": 0,
+            "by_trigger": {},
+            "by_symbol": {},
+        }
+
+    windows = {name: _empty_window() for name in cutoffs}
+    last_event = None
+    total_events = 0
+
+    if journal_path.exists():
+        try:
+            for raw in journal_path.read_text().strip().split("\n"):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    trade = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                trigger = trade.get("action") or ""
+                if trigger not in CUTLOSS_ACTIONS:
+                    continue
+
+                ts_raw = trade.get("timestamp") or ""
+                try:
+                    # Timestamps are ISO-8601 UTC; strip tzinfo for naive compare.
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    if ts.tzinfo:
+                        ts = ts.replace(tzinfo=None)
+                except (TypeError, ValueError):
+                    continue
+
+                notional = float(trade.get("notional_usd") or 0.0)
+                symbol = trade.get("symbol") or "?"
+                total_events += 1
+                if last_event is None or ts_raw > last_event["timestamp"]:
+                    last_event = {
+                        "timestamp": ts_raw,
+                        "symbol": symbol,
+                        "trigger": trigger,
+                        "notional": notional,
+                    }
+
+                for name, cutoff in cutoffs.items():
+                    if ts < cutoff:
+                        continue
+                    w = windows[name]
+                    w["events"] += 1
+                    w["notional"] += notional
+                    w["by_trigger"][trigger] = w["by_trigger"].get(trigger, 0) + 1
+                    w["by_symbol"][symbol] = w["by_symbol"].get(symbol, 0) + 1
+                    if trigger in _PER_POSITION_TRIGGERS:
+                        w["per_position_stops"] += 1
+                    elif trigger in _SOFT_SCALE_TRIGGERS:
+                        w["soft_scale_partials"] += 1
+                    elif trigger in _PORTFOLIO_STOP_TRIGGERS:
+                        w["portfolio_stops"] += 1
+        except Exception as e:
+            return jsonify({"error": f"failed to read journal: {e}"}), 500
+
+    # Round notional + sort top symbols
+    for name in windows:
+        w = windows[name]
+        w["notional"] = round(w["notional"], 2)
+        # Top 5 most-stopped symbols in this window
+        w["top_symbols"] = sorted(
+            w["by_symbol"].items(), key=lambda kv: -kv[1]
+        )[:5]
+
+    return jsonify({
+        "model": model_name,
+        "total_events_all_time": total_events,
+        "last_event": last_event,
+        "windows": windows,
+        "journal_path": str(journal_path),
+        "journal_exists": journal_path.exists(),
+    })
 
 
 @app.route("/api/portfolio/<model_name>")
@@ -2590,22 +2707,83 @@ def index():
     }}
 
     async function loadCutloss(model) {{
-        const events = await api(`/api/cutloss/${{model}}`);
-        let html = '<div class="card"><h2>&#9888; Cut-Loss Events</h2>';
+        // Fetch summary stats + event list in parallel so the panel paints once.
+        const [stats, events] = await Promise.all([
+            api(`/api/cutloss-stats/${{model}}`),
+            api(`/api/cutloss/${{model}}`),
+        ]);
 
+        let html = '';
+
+        // -- Summary stats card (today / 7d / 30d) -------------------------
+        if (stats && stats.windows) {{
+            const w = stats.windows;
+            const fmtNotional = (n) => '$' + (n || 0).toLocaleString('en-US', {{maximumFractionDigits: 0}});
+            const winColumn = (label, key) => {{
+                const x = w[key] || {{}};
+                const triggers = x.by_trigger || {{}};
+                const totalEvents = x.events || 0;
+                const sub = totalEvents === 0
+                    ? '<div style="color:var(--text-dim);font-size:11px;margin-top:6px">no events</div>'
+                    : `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;line-height:1.5">
+                        <div>${{x.per_position_stops || 0}} per-position stop${{x.per_position_stops === 1 ? '' : 's'}}</div>
+                        <div>${{x.soft_scale_partials || 0}} soft-scale partial${{x.soft_scale_partials === 1 ? '' : 's'}}</div>
+                        <div>${{x.portfolio_stops || 0}} portfolio liquidation${{x.portfolio_stops === 1 ? '' : 's'}}</div>
+                       </div>`;
+                const notionalLine = totalEvents > 0
+                    ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px">${{fmtNotional(x.notional)}} notional</div>`
+                    : '';
+                return `<div style="background:#0a0c10;border:1px solid var(--card-border);border-radius:6px;padding:12px;flex:1;min-width:160px">
+                    <div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${{label}}</div>
+                    <div style="font-size:24px;font-weight:700;color:var(--text-bright)">${{totalEvents}}</div>
+                    <div style="font-size:11px;color:var(--text-dim)">total event${{totalEvents === 1 ? '' : 's'}}</div>
+                    ${{sub}}
+                    ${{notionalLine}}
+                </div>`;
+            }};
+            const last = stats.last_event;
+            const lastLine = last
+                ? `<div style="font-size:11px;color:var(--text-dim);margin-top:14px">
+                    Latest: ${{fmtET(last.timestamp)}} &middot; <strong>${{last.symbol}}</strong> &middot;
+                    ${{(last.trigger || '').replace('_', ' ')}}
+                    ${{last.notional ? ' &middot; ' + fmtNotional(last.notional) : ''}}
+                   </div>`
+                : '';
+            html += `<div class="card">
+                <h2>&#9888; Cut-Loss Activity</h2>
+                <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">
+                    Per-position stops: hard (-8% from entry), trailing (-5% from peak).
+                    Soft scale: Tier 1 (-3% daily DD) sells to 60% exposure; Tier 2 (-5%) to 30%.
+                    Portfolio liquidation: Tier 3 (-7%) closes everything + trips today's flag.
+                </p>
+                <div style="display:flex;gap:10px;flex-wrap:wrap">
+                    ${{winColumn('Today', 'today')}}
+                    ${{winColumn('Last 7 days', 'last_7d')}}
+                    ${{winColumn('Last 30 days', 'last_30d')}}
+                </div>
+                ${{lastLine}}
+            </div>`;
+        }}
+
+        // -- Event list ----------------------------------------------------
+        html += '<div class="card"><h2>Recent events</h2>';
         if (events && events.length > 0) {{
             html += `<p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">
-                Showing ${{events.length}} cutloss event(s). Triggers: hard stop (-8% from entry),
-                trailing stop (-5% from peak), portfolio stop (-3% daily drawdown).
+                Showing ${{events.length}} cutloss event(s) — newest first.
             </p>`;
             html += `<table>
                 <tr><th>Time</th><th>Symbol</th><th>Trigger</th><th>Detail</th>
                     <th>Shares</th><th>Status</th><th>Source</th></tr>`;
             events.forEach(e => {{
                 const displayTs = fmtET(e.timestamp || '');
-                const triggerLabel = (e.trigger || '').replace('_', ' ').toUpperCase();
-                const triggerCls = e.trigger === 'portfolio_stop' ? 'red' :
-                                   e.trigger === 'hard_stop' ? 'red' : 'yellow';
+                const triggerLabel = (e.trigger || '').replace(/_/g, ' ').toUpperCase();
+                const isLiquidation = e.trigger === 'portfolio_stop';
+                const isPerPositionHard = e.trigger === 'hard_stop';
+                const isSoftScale = e.trigger === 'soft_scale_tier1' || e.trigger === 'soft_scale_tier2';
+                const triggerCls = isLiquidation ? 'red'
+                                 : isPerPositionHard ? 'red'
+                                 : isSoftScale ? 'green'
+                                 : 'yellow';
                 const statusCls = (e.order_status === 'rejected' || e.order_status === 'canceled') ? 'red' : '';
                 html += `<tr>
                     <td class="mono" style="font-size:11px">${{displayTs}}</td>
