@@ -814,6 +814,18 @@ def api_cutloss_stats(model_name):
                     continue
 
                 notional = float(trade.get("notional_usd") or 0.0)
+                # Backfill: legacy cutloss trades recorded notional_usd=0
+                # because Alpaca's DELETE-position endpoint doesn't return
+                # a notional. Reconstruct from shares × fill_price when
+                # both are available.
+                if notional == 0.0:
+                    shares = trade.get("shares")
+                    fill_price = trade.get("fill_price")
+                    if shares and fill_price:
+                        try:
+                            notional = round(float(shares) * float(fill_price), 2)
+                        except (TypeError, ValueError):
+                            pass
                 symbol = trade.get("symbol") or "?"
                 total_events += 1
                 if last_event is None or ts_raw > last_event["timestamp"]:

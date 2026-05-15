@@ -514,6 +514,11 @@ def _execute_cutloss_sell(mc: "ModelConfig", symbol: str, qty: float,
             except Exception:
                 pass
 
+        # Notional for the journal: Alpaca's `DELETE /v2/positions/<sym>`
+        # doesn't return a notional, so we compute it ourselves from the
+        # post-poll fill data. Falls back to 0 if either is unknown.
+        notional = round(filled_qty * fill_price, 2) if (filled_qty and fill_price) else 0.0
+
         journal = TradeJournal(mc.name)
         record = TradeRecord(
             trade_id=f"{mc.name}_cutloss_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{symbol}",
@@ -525,7 +530,7 @@ def _execute_cutloss_sell(mc: "ModelConfig", symbol: str, qty: float,
             action=reason,
             order_type="market",
             time_in_force="day",
-            notional_usd=0,
+            notional_usd=notional,
             order_status=order_status,
             order_id=order_id,
             error_message=result.get("reject_reason") if order_status in ("rejected", "canceled", "expired") else None,
