@@ -329,9 +329,17 @@ def compute_macro_features(macro_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_feature_func(feature_version: str):
-    """Return the appropriate feature computation function for a model version."""
-    if feature_version in ("v5", "v6", "v8"):
-        # v5 features are a subset of v6; v8 uses v6 base + sector-relative.
+    """Return the appropriate feature computation function for a model version.
+
+    `v9` is Bot 8's quant-v6 ensemble — its base models were trained on the
+    same v6 per-symbol feature set (plus 38 alt-data columns we don't yet
+    ingest in production). The alt-data columns are zero-filled at predict
+    time by `inference.predict_rankings`, so the per-symbol feature pipeline
+    is identical to v6.
+    """
+    if feature_version in ("v5", "v6", "v8", "v9"):
+        # v5 features are a subset of v6; v8 uses v6 base + sector-relative;
+        # v9 uses v6 base + (zero-filled) alt-data.
         return compute_stock_features_v6
     return compute_stock_features
 
