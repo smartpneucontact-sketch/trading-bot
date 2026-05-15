@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy app
 COPY pipeline.py .
 COPY dashboard.py .
+COPY core/ core/
 COPY model/ model/
 
 # Create persistent data directory (mount a Railway volume here)
