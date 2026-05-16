@@ -69,6 +69,11 @@ MODEL_REGISTRY: dict[str, dict] = {
     "v6": {"feature_version": "v6", "model_dir": "v6", "fallback_model": None},
     "v7": {"feature_version": "v6", "model_dir": "v7", "fallback_model": None},
     "v8": {"feature_version": "v8", "model_dir": "v8", "fallback_model": None},
+    # v9 = Bot 8 quant-v6 ensemble (5d horizon, 174 features). Uses
+    # meta_quant_only (Ridge over 5 base preds). Production zero-fills
+    # the ~38 alt-data features (FINRA short volume, Form 4, 8-K, EDGAR
+    # fundamentals) that aren't ingested yet.
+    "v9": {"feature_version": "v9", "model_dir": "v9", "fallback_model": None},
 }
 
 
@@ -168,6 +173,41 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
                     "Walk-forward validation with sector-neutral portfolio evaluation "
                     "at each fold (HHI concentration metric tracked).",
     },
+    "v9": {
+        "title": "V9 — Bot 8 Quant-v6 Ensemble (Experimental)",
+        "summary": "Re-trained 5-day stacked ensemble from the Bot 8 research repo. "
+                   "Same base architecture as V6/V7 (5 models + Ridge meta) but with "
+                   "a richer 174-column feature set (fundamentals, TLT correlation, "
+                   "60d realized skew/kurtosis cross-sectional ranks). Side-by-side "
+                   "experimental slot — running alongside V6/V7/V8, not replacing them.",
+        "architecture": "Stacked ensemble: 5 base models (LightGBM main, LightGBM "
+                        "regularized, LightGBM DART, XGBoost, CatBoost) → Ridge "
+                        "meta-learner trained on the 5 base predictions "
+                        "(meta_quant_only variant — production does NOT ingest the "
+                        "FinBERT/Claude features that the meta_with_all variant uses).",
+        "features": "174 features: 68 per-symbol (returns, vol, technicals, etc.) + "
+                    "20 macro (VIX/SPY/credit/TLT) + 14 EDGAR fundamentals + 14 "
+                    "fundamentals ranks + 7 FINRA short volume + 6 SEC Form 4 "
+                    "insider + 11 SEC Form 8-K + 16 cross-sectional ranks + 18 "
+                    "sector-relative ranks. Production currently zero-fills the "
+                    "~38 alt-data columns (FINRA / Form 4 / Form 8-K / EDGAR not "
+                    "yet ingested in production); per-symbol + macro + ranks come "
+                    "from the existing v6 feature pipeline.",
+        "portfolio": "Conviction-weighted top 20 (same as V6). Allocation proportional "
+                     "to prediction strength, capped at 2× equal weight. Held 5 trading "
+                     "days then rebalanced.",
+        "risk": "Same soft-tiered Phase 1 risk overlay as V7:\n"
+                "  1. Hard stop: auto-sell if position drops 8% from entry price.\n"
+                "  2. Trailing stop: auto-sell if position drops 5% from its peak.\n"
+                "  3. Portfolio stop: TIERED — Tier 1 (-3% daily DD) scales exposure "
+                "to 60%, Tier 2 (-5%) to 30%, Tier 3 (-7%) full liquidate + trip flag.\n"
+                "Plus V6's market regime filter for position sizing.",
+        "training": "Trained 2026-05-06 on Bot 8's research data (916-symbol universe: "
+                    "SP500 + SP400 + NDX100). Walk-forward validation, 6 folds. "
+                    "In-sample 5d IC: meta_quant_only +0.0106, meta_with_all +0.0130. "
+                    "Note the universe gap vs production (SP500 + NDX100 + R1K) — "
+                    "predictions on R1K names not in training will be noisier.",
+    },
 }
 
 
@@ -208,6 +248,19 @@ def _default_config() -> dict:
                 "alpaca_key": "",
                 "alpaca_secret": "",
                 "enable_cutloss": False,
+                "cutloss_hard_stop": -8.0,
+                "cutloss_trailing_stop": -5.0,
+                "cutloss_portfolio_stop": -3.0,
+            },
+            {
+                # V9 — Bot 8 quant-v6 ensemble (experimental). Mirrors v7's
+                # risk overlay (soft tiered cutloss enabled).
+                "slot_id": 4,
+                "model": "v9",
+                "enabled": True,
+                "alpaca_key": "",
+                "alpaca_secret": "",
+                "enable_cutloss": True,
                 "cutloss_hard_stop": -8.0,
                 "cutloss_trailing_stop": -5.0,
                 "cutloss_portfolio_stop": -3.0,
