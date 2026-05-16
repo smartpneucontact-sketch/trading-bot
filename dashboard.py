@@ -3442,11 +3442,14 @@ def index():
     }}
 
     function renderSlots(config) {{
-        const available = config.available_models || ['v4','v5','v6','v7','v8'];
+        const available = config.available_models || ['v4','v5','v6','v7','v8','v9'];
         const slots = config.slots || [];
+        // Show as many slots as exist in the config, with a minimum of 4
+        // so v9 can be added even on a config file that pre-dates the v9 slot.
+        const nSlots = Math.max(slots.length, 4);
         let html = '';
 
-        for (let i = 0; i < 3; i++) {{
+        for (let i = 0; i < nSlots; i++) {{
             const slot = slots[i] || {{ slot_id: i+1, model: '', enabled: true, alpaca_key: '', alpaca_secret: '' }};
             const enabled = slot.enabled !== false;
             const hasKey = slot.alpaca_key && slot.alpaca_key.length > 0;
@@ -3584,10 +3587,15 @@ def index():
 
     async function saveConfig() {{
         const slots = [];
-        for (let i = 0; i < 3; i++) {{
+        // Iterate however many slot cards the renderSlots loop produced.
+        // The cards expose ids slot-model-0, slot-model-1, ... slot-model-N.
+        // Stop when the next slot's model dropdown is absent from the DOM.
+        for (let i = 0; ; i++) {{
+            const modelEl = $(`slot-model-${{i}}`);
+            if (!modelEl) break;
             slots.push({{
                 slot_id: i + 1,
-                model: $(`slot-model-${{i}}`).value,
+                model: modelEl.value,
                 enabled: $(`slot-enabled-${{i}}`).checked,
                 alpaca_key: $(`slot-key-${{i}}`).value.trim(),
                 alpaca_secret: $(`slot-secret-${{i}}`).value.trim(),
