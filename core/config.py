@@ -52,6 +52,13 @@ class ModelConfig:
     cutloss_hard_stop: float = -8.0
     cutloss_trailing_stop: float = -5.0
     cutloss_portfolio_stop: float = -3.0
+    # Target portfolio leverage. 1.0 = invest exactly portfolio_value (cash
+    # account behavior). 2.0 = use 2× equity via Reg-T margin. Alpaca paper
+    # accounts default to ~2.37x buying_power; orders will fail if the
+    # requested leverage exceeds Alpaca's available buying power. Cutloss
+    # thresholds stay in portfolio-% terms — at higher leverage a smaller
+    # market move trips Tier 1 of the soft stop.
+    target_leverage: float = 1.0
 
     def __post_init__(self):
         if self.state_path is None:
@@ -254,7 +261,12 @@ def _default_config() -> dict:
             },
             {
                 # V9 — Bot 8 quant-v6 ensemble (experimental). Mirrors v7's
-                # risk overlay (soft tiered cutloss enabled).
+                # risk overlay (soft tiered cutloss enabled) plus 2x
+                # Reg-T margin so the backtested alpha has a chance to
+                # show up live. Cutloss thresholds stay in portfolio-%
+                # terms — Tier 1 fires at ~-1.5% market move when
+                # leveraged 2x; soft tiered scaling handles that without
+                # full liquidation.
                 "slot_id": 4,
                 "model": "v9",
                 "enabled": True,
@@ -264,6 +276,7 @@ def _default_config() -> dict:
                 "cutloss_hard_stop": -8.0,
                 "cutloss_trailing_stop": -5.0,
                 "cutloss_portfolio_stop": -3.0,
+                "target_leverage": 2.0,
             },
         ],
         "updated_at": None,
@@ -354,6 +367,7 @@ def get_active_models() -> list[ModelConfig]:
                 cutloss_hard_stop=slot.get("cutloss_hard_stop", -8.0),
                 cutloss_trailing_stop=slot.get("cutloss_trailing_stop", -5.0),
                 cutloss_portfolio_stop=slot.get("cutloss_portfolio_stop", -3.0),
+                target_leverage=float(slot.get("target_leverage", 1.0) or 1.0),
             ))
 
     # -- Fallback to env vars if no slot in the config actually activated.

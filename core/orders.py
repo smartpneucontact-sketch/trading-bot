@@ -169,19 +169,50 @@ def rebalance_portfolio(
     to_hold = sorted(current_set & target_set)
 
     # Per-symbol target dollar allocations
+    #
+    # `target_leverage` (default 1.0) multiplies the total book size.
+    # 2.0 means we target 2× equity in long positions via Reg-T margin —
+    # Alpaca's buying_power must cover this or orders will reject. The
+    # buying_power pre-flight below warns before submission.
+    leverage = float(getattr(mc, "target_leverage", 1.0) or 1.0)
     if target_weights:
-        sym_allocations = {sym: portfolio_value * w for sym, w in target_weights.items()}
-        avg_weight = portfolio_value / len(target_symbols)
+        sym_allocations = {
+            sym: portfolio_value * w * leverage
+            for sym, w in target_weights.items()
+        }
+        avg_weight = portfolio_value * leverage / len(target_symbols)
         rb_data["target_weight"] = avg_weight
         rb_data["sizing_mode"] = "conviction"
+        lev_tag = f" × {leverage}x leverage" if leverage != 1.0 else ""
         logger.info(
-            f"  Sizing: CONVICTION-WEIGHTED (exposure={sum(target_weights.values()):.0%})"
+            f"  Sizing: CONVICTION-WEIGHTED "
+            f"(exposure={sum(target_weights.values()):.0%}{lev_tag})"
         )
     else:
-        avg_weight = portfolio_value / len(target_symbols)
+        avg_weight = portfolio_value * leverage / len(target_symbols)
         sym_allocations = {sym: avg_weight for sym in target_symbols}
         rb_data["target_weight"] = avg_weight
-        rb_data["sizing_mode"] = "equal"
+        rb_data["sizing_mode"] = "equal" if leverage == 1.0 else f"equal × {leverage}x"
+
+    rb_data["target_leverage"] = leverage
+
+    # Pre-flight check: at higher leverage, Alpaca's buying_power must
+    # cover the total target notional. If not, log warning and continue
+    # (Alpaca will reject overage orders; better to surface this clearly).
+    total_target_notional = sum(sym_allocations.values())
+    bp = float(acct.get("buying_power", 0))
+    if total_target_notional > bp:
+        logger.warning(
+            f"  [REBALANCE] target notional ${total_target_notional:,.2f} "
+            f"exceeds buying_power ${bp:,.2f} (leverage={leverage}x, "
+            f"equity=${portfolio_value:,.2f}). "
+            f"Alpaca will likely reject some orders — consider reducing "
+            f"target_leverage to {bp / max(portfolio_value, 1):.2f}x or lower."
+        )
+        report.add_warning(
+            f"target notional ${total_target_notional:,.0f} > buying_power "
+            f"${bp:,.0f}; orders may be rejected"
+        )
 
     total_positions = max(len(target_set) + len(current_set), 1)
     turnover = (len(to_sell) + len(to_buy)) / total_positions

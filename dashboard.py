@@ -3512,6 +3512,18 @@ def index():
                     <span id="slot-test-${{i}}" style="font-size:11px"></span>
                 </div>
 
+                <div style="border-top:1px solid var(--card-border);padding-top:10px;margin-bottom:10px">
+                    <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:4px">
+                        TARGET LEVERAGE
+                        <span style="font-size:10px;color:var(--text-dim);font-weight:normal">
+                          (1.0 = cash account, 2.0 = Reg-T margin; Alpaca paper supports ~2.37x)
+                        </span>
+                    </label>
+                    <input type="number" id="slot-leverage-${{i}}" value="${{slot.target_leverage || 1.0}}"
+                           min="1.0" max="4.0" step="0.1"
+                           style="width:120px;background:var(--bg);color:var(--text);border:1px solid var(--card-border);
+                                  padding:6px 10px;border-radius:6px;font-size:12px;font-family:var(--mono)">
+                </div>
                 <div style="border-top:1px solid var(--card-border);padding-top:10px">
                     <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);cursor:pointer">
                         <input type="checkbox" id="slot-cutloss-${{i}}" ${{slot.enable_cutloss ? 'checked' : ''}}
@@ -3603,6 +3615,7 @@ def index():
                 cutloss_hard_stop: parseFloat($(`slot-hard-${{i}}`).value) || -8.0,
                 cutloss_trailing_stop: parseFloat($(`slot-trail-${{i}}`).value) || -5.0,
                 cutloss_portfolio_stop: parseFloat($(`slot-portfolio-${{i}}`).value) || -3.0,
+                target_leverage: parseFloat($(`slot-leverage-${{i}}`)?.value) || 1.0,
             }});
         }}
 
