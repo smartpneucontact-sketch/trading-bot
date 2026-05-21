@@ -81,6 +81,13 @@ MODEL_REGISTRY: dict[str, dict] = {
     # the ~38 alt-data features (FINRA short volume, Form 4, 8-K, EDGAR
     # fundamentals) that aren't ingested yet.
     "v9": {"feature_version": "v9", "model_dir": "v9", "fallback_model": None},
+    # combo_v1 = direct-weights 4-signal momentum portfolio. Does NOT use
+    # the ML rank-and-conviction path — instead the runner detects the
+    # bundle's `strategy_type="direct_weights"` and calls
+    # `model.compute_weights(stock_data, macro_data)` to size positions
+    # directly. Holds both stocks and macro/sector ETFs (~30-50 positions).
+    # See core/combo_strategy.py for the four sleeves.
+    "combo_v1": {"feature_version": "combo", "model_dir": "combo_v1", "fallback_model": None},
 }
 
 
@@ -215,6 +222,45 @@ MODEL_DESCRIPTIONS: dict[str, dict] = {
                     "Note the universe gap vs production (SP500 + NDX100 + R1K) — "
                     "predictions on R1K names not in training will be noisier.",
     },
+    "combo_v1": {
+        "title": "Combo V1 — 4-Signal Multi-Horizon Multi-Asset Momentum",
+        "summary": "Direct-weights portfolio that allocates across four uncorrelated "
+                   "momentum sleeves AND macro/sector ETFs (not just stocks). Skips "
+                   "the rank+conviction path entirely — it emits a complete weights "
+                   "dict in one shot. Designed to clear ~3%/month live at 2.5x "
+                   "leverage based on 10-year backtest (Apr-2016 → Mar-2026).",
+        "architecture": "Direct-weights strategy (no ML model). Four sleeves:\n"
+                        "  • 30% xs_momentum_top30 — long top-30 stocks by 12-1 mo return\n"
+                        "  • 25% xs_momentum_fast — long top-20 stocks by 3-1 wk return\n"
+                        "  • 20% dual_momentum_vol — top-30 by 6-mo return, inverse-vol weighted\n"
+                        "  • 25% ts_momentum_multiasset — long 20 macro/sector ETFs with "
+                        "positive 12-mo return, inverse-vol weighted\n"
+                        "After blending, SPY-drawdown gate caps exposure to 0 when SPY is "
+                        "≥18% below its 60-day high (linear ramp from 8% DD).",
+        "features": "Computed inline from raw daily OHLCV bars: per-stock 12-1 / 3-1 / "
+                    "6-mo cumulative returns + 60-day realized vol; macro ETF "
+                    "12-mo returns. No engineered feature set, no ML model.",
+        "portfolio": "30-50 positions spanning ~30 stocks + ~10-15 ETFs (SPY/QQQ/IWM/"
+                     "TLT/SHY/HYG/GLD/USO/UUP + 11 sector SPDRs). Rebalanced weekly "
+                     "(horizon=5d). Weights sum to ≤100% pre-leverage; target_leverage "
+                     "(default 2.5x) scales the book in rebalance_portfolio().",
+        "risk": "Two overlays inside the strategy itself:\n"
+                "  1. SPY drawdown gate: 60-day DD ≥8% → linear ramp toward cash; "
+                "≥18% → full cash.\n"
+                "  2. Per-sleeve vol-targeting on the dual/TS sleeves (caps each at "
+                "15-20% annualized vol).\n"
+                "Plus the runner's cut-loss scanner if `enable_cutloss=True` "
+                "(hard -8% / trailing -5% / portfolio -3% tiered). At 2.5x leverage "
+                "the cutloss tier fires quickly; pair with cutloss_portfolio_stop=-3 "
+                "for predictable tier behavior.\n"
+                "Reference backtest max-drawdown: -59.5% (2022 momentum/tech reversal).",
+        "training": "No training. The strategy is a pure-rule allocator. The "
+                    "backtest in /Traiding 11/REPORT.md covers 10 years (2016-04 → "
+                    "2026-03, 1040 stocks, 5 bp/side TC) and produced 4.17%/mo mean, "
+                    "2.95%/mo median, Sharpe 1.00, 10 of 11 years positive, with the "
+                    "single bad year (2022) at -38.6%. Live expectation after a "
+                    "15-30% friction haircut: 2.9-3.5%/mo.",
+    },
 }
 
 
@@ -277,6 +323,27 @@ def _default_config() -> dict:
                 "cutloss_trailing_stop": -5.0,
                 "cutloss_portfolio_stop": -3.0,
                 "target_leverage": 2.0,
+            },
+            {
+                # Combo_v1 — direct-weights 4-signal momentum at 2.5x leverage.
+                # Targets ~3%/mo live per the /Traiding 11 10-year backtest.
+                # Cutloss enabled with the same -8/-5/-3 tiered thresholds as
+                # v9 — at 2.5x leverage the portfolio-stop tier (-3%) fires
+                # earlier on raw market moves, which is exactly the tail
+                # protection we want for a high-leverage book.
+                # NOTE: 2.5x leverage may exceed Alpaca paper's default
+                # buying power (≈2.37x). If orders reject, reduce
+                # target_leverage to 2.0 via the dashboard.
+                "slot_id": 5,
+                "model": "combo_v1",
+                "enabled": True,
+                "alpaca_key": "",
+                "alpaca_secret": "",
+                "enable_cutloss": True,
+                "cutloss_hard_stop": -8.0,
+                "cutloss_trailing_stop": -5.0,
+                "cutloss_portfolio_stop": -3.0,
+                "target_leverage": 2.5,
             },
         ],
         "updated_at": None,

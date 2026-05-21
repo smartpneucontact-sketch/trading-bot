@@ -32,7 +32,12 @@ MIN_HISTORY_DAYS = 250  # need at least this many days for the 252-day features
 MACRO_TICKERS: list[str] = [
     "^VIX", "SPY", "QQQ", "IWM", "TLT", "SHY", "HYG",
     "GLD", "USO", "UUP",
-    "XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU",
+    # All 11 GICS sector SPDRs. XLB / XLC / XLRE added in 2026-05 with the
+    # combo_v1 deploy — it allocates to the full sector set via the
+    # time-series momentum sleeve. Existing v6/v8 features only consume
+    # the first 8; the extras are harmless to features.py (it ignores
+    # unrecognised macro columns when computing sector_rel_*).
+    "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY",
 ]
 
 MACRO_RENAME: dict[str, str] = {"^VIX": "VIX"}

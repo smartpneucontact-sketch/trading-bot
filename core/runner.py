@@ -25,6 +25,7 @@ import pickle
 import traceback
 from datetime import datetime, timezone
 
+from core.combo_strategy import ComboConfig, ComboStrategy
 from core.config import ModelConfig, get_active_models
 from core.data import download_bars, download_macro
 from core.ensemble import EnsembleModel, StackedEnsemble
@@ -48,7 +49,10 @@ from core.universe import EXCLUDED_SYMBOLS, get_tradeable_symbols
 # can override per-run via kwargs.
 DEFAULT_TOP_N = 20
 DEFAULT_HORIZON = 5
-DEFAULT_LOOKBACK_DAYS = 300
+# 365 days (was 300) so combo_v1's 12-month momentum lookback has full
+# history with margin. v4/v6/v8/v9 only need 252 + some buffer; the extra
+# 65 days adds negligible download cost.
+DEFAULT_LOOKBACK_DAYS = 365
 
 # Data-quality safeguards: refuse to rebalance with partial yfinance pulls.
 # Full universe ≈ 1000 stocks; <500 means rate-limiting hit. Macro is normally
@@ -69,6 +73,11 @@ def load_model_bundle(model_path) -> dict:
         _class_map = {
             "StackedEnsemble": StackedEnsemble,
             "EnsembleModel": EnsembleModel,
+            # combo_v1 lives in core/combo_strategy.py; bundles created from
+            # local environments where the import path is e.g. `__main__`
+            # (the bundling script) still resolve cleanly.
+            "ComboStrategy": ComboStrategy,
+            "ComboConfig": ComboConfig,
         }
         _known_training_modules = {
             "__main__",
@@ -77,6 +86,10 @@ def load_model_bundle(model_path) -> dict:
             "scripts.train_ml_v8",
             "train_ml_v4", "train_ml_v5",
             "train_ml_v6", "train_ml_v7", "train_ml_v8",
+            "build_combo_v1", "scripts.build_combo_v1",
+            # An older bundle might have been created from the package path
+            # itself — accept that too:
+            "core.combo_strategy",
         }
 
         def find_class(self, module, name):
@@ -124,14 +137,24 @@ def run_single_model(
 
     model_bundle = load_model_bundle(mc.model_path)
     model = model_bundle["model"]
-    feature_cols = model_bundle["feature_cols"]
+    feature_cols = model_bundle.get("feature_cols", []) or []
+    # `strategy_type` selects the prediction path. "ml_ranker" (default)
+    # keeps the existing v4/v6/v8 flow (per-stock features → model.predict
+    # → ranked → conviction weights). "direct_weights" means the model
+    # exposes `.compute_weights(stock_data, macro_data) -> {sym: weight}`
+    # and we skip the rank+conviction path entirely. Combo_v1 uses the
+    # latter (it allocates to macro ETFs + multiple horizons; the rank
+    # framework can't express that).
+    strategy_type = model_bundle.get("strategy_type", "ml_ranker")
     logger.info(
         f"  Model: {len(feature_cols)} features, "
         f"horizon={model_bundle.get('horizon', '?')}d, "
-        f"task={model_bundle.get('task', '?')}"
+        f"task={model_bundle.get('task', '?')}, "
+        f"strategy_type={strategy_type}"
     )
     logger.info(f"  Trained: {model_bundle.get('saved_at', '?')}")
     report.set("n_features", len(feature_cols))
+    report.set("strategy_type", strategy_type)
     report.end_step("load_model")
 
     # -- Step 2: Check state ------------------------------------------------
@@ -205,56 +228,149 @@ def run_single_model(
     # -- Step 4: Generate predictions ---------------------------------------
     logger.info("\n[4/5] GENERATING PREDICTIONS")
     logger.info(f"  Feature version: {mc.feature_version}")
-    rankings = predict_rankings(
-        stock_data, macro_features, model, feature_cols, logger, report,
-        feature_version=mc.feature_version,
-    )
 
-    # Filter inactive/untradeable assets (e.g. HOLX after delisting).
-    # Walk further down the ranking until we have at least `top_n` tradeable
-    # candidates so a few delistings don't abort the rebalance.
-    if not dry_run and mc.alpaca_key:
-        all_inactive: set[str] = set()
-        check_window = top_n * 2
-        max_window = min(len(rankings), top_n * 5)  # never check more than top 100
-        while True:
-            window_syms = [sym for sym, _ in rankings[:check_window]]
-            inactive = fetch_inactive_assets(window_syms, mc, logger, top_n=top_n)
-            all_inactive.update(inactive)
-            tradeable_in_window = [s for s in window_syms if s not in all_inactive]
-            if len(tradeable_in_window) >= top_n or check_window >= max_window:
-                break
-            check_window = min(check_window + top_n, max_window)
-            logger.info(
-                f"  Only {len(tradeable_in_window)}/{top_n} tradeable in top "
-                f"{check_window - top_n}; extending check to top {check_window}"
+    # ── Branch A: direct-weights strategies (combo_v1 etc.) ───────────
+    # These bypass the rank+conviction path because they need to size
+    # macro ETFs and multi-horizon stock sleeves in one shot.
+    if strategy_type == "direct_weights":
+        if not hasattr(model, "compute_weights"):
+            msg = (
+                f"strategy_type={strategy_type} but model has no "
+                f"compute_weights(stock_data, macro_data) method. "
+                f"Bundle is malformed; aborting slot."
             )
-        if all_inactive:
-            rankings = [(sym, pred) for sym, pred in rankings if sym not in all_inactive]
-            report.set("inactive_assets_filtered", sorted(all_inactive))
+            logger.error(msg)
+            report.add_error(msg)
+            logger.info(report.format_summary())
+            return
 
-    if len(rankings) < top_n:
-        logger.error(f"Only {len(rankings)} predictions - need at least {top_n}")
-        report.add_error(f"Insufficient predictions: {len(rankings)} < {top_n}")
-        logger.info(report.format_summary())
-        return
+        try:
+            raw_weights = model.compute_weights(stock_data, macro_data or {})
+        except Exception as e:
+            logger.error(f"compute_weights() failed: {e}\n{traceback.format_exc()}")
+            report.add_error(f"compute_weights failed: {e}")
+            logger.info(report.format_summary())
+            return
 
-    # Final guard: re-apply EXCLUDED_SYMBOLS in case a cached universe
-    # pre-dates an exclusion change.
-    rankings = [(sym, p) for sym, p in rankings if sym not in EXCLUDED_SYMBOLS]
+        if not raw_weights:
+            logger.error("compute_weights returned no positions — staying in cash")
+            report.add_error("Empty target_weights from direct-weight strategy")
+            logger.info(report.format_summary())
+            return
 
-    target_symbols = [sym for sym, _ in rankings[:top_n]]
-    report.set("target_portfolio", rankings[:top_n])
+        # Sort symbols by weight desc so the report logs the largest first.
+        # Build a `rankings` stub so downstream code (journal, state.history)
+        # has the (sym, score) tuples it expects.
+        sorted_syms = sorted(raw_weights.items(), key=lambda x: -x[1])
+        rankings = [(sym, float(w)) for sym, w in sorted_syms]
+        target_symbols = [sym for sym, _ in sorted_syms]
+        target_weights = {sym: float(w) for sym, w in raw_weights.items()}
 
-    logger.info(f"\n  Target portfolio ({top_n} stocks):")
-    for i, (sym, pred) in enumerate(rankings[:top_n]):
-        logger.info(f"    {i+1:2d}. {sym:6s}  pred={pred:+6.2f}%")
+        logger.info(
+            f"  Direct weights: {len(target_weights)} positions, "
+            f"gross exposure={sum(abs(w) for w in target_weights.values()):.0%}"
+        )
+        for sym, w in sorted_syms[:8]:
+            logger.info(f"    {sym:6s}  weight={w:+.4f}")
+        if len(sorted_syms) > 8:
+            logger.info(f"    ... and {len(sorted_syms) - 8} more")
+        report.set("direct_weights", {sym: round(w, 6) for sym, w in target_weights.items()})
 
-    # -- V6/V8: regime score → conviction-weighted (optionally sector-neutral)
-    target_weights: dict[str, float] | None = None
-    regime_exposure = 1.0
+        # Skip the prediction-quality filters and jump straight to rebalance.
+        # (The rest of the function uses `rankings`, `target_symbols`,
+        #  `target_weights` exactly as the rank path does.)
+        regime_exposure = 1.0
 
-    if mc.feature_version in ("v6", "v8") and macro_data is not None:
+    else:
+        rankings = predict_rankings(
+            stock_data, macro_features, model, feature_cols, logger, report,
+            feature_version=mc.feature_version,
+        )
+
+    # ───────────────────────────────────────────────────────────────────
+    # The inactive-asset filter + EXCLUDED_SYMBOLS guard + conviction-
+    # weighting block below applies only to the ML-ranker path. The
+    # direct_weights branch above already filled `target_symbols`,
+    # `target_weights`, `rankings`, and `regime_exposure`; nothing else
+    # to do until rebalance.
+    # ───────────────────────────────────────────────────────────────────
+    if strategy_type == "direct_weights":
+        # Light filter: drop any direct-weight position whose ticker is in
+        # EXCLUDED_SYMBOLS (e.g. a stock you've added to the exclude list
+        # for compliance reasons). ETFs are not in EXCLUDED_SYMBOLS.
+        kept = {s: w for s, w in target_weights.items() if s not in EXCLUDED_SYMBOLS}
+        dropped = set(target_weights.keys()) - set(kept.keys())
+        if dropped:
+            logger.info(f"  Excluded {len(dropped)} positions via EXCLUDED_SYMBOLS: {sorted(dropped)}")
+            target_weights = kept
+            target_symbols = [s for s in target_symbols if s in target_weights]
+            rankings = [(s, w) for s, w in rankings if s in target_weights]
+        # Inactive-asset filter (best-effort, single round; combo may hold
+        # 30-50 positions including ETFs so we check all of them at once).
+        if not dry_run and mc.alpaca_key and target_symbols:
+            try:
+                inactive = fetch_inactive_assets(target_symbols, mc, logger,
+                                                 top_n=len(target_symbols))
+                if inactive:
+                    target_weights = {s: w for s, w in target_weights.items()
+                                      if s not in inactive}
+                    target_symbols = [s for s in target_symbols if s not in inactive]
+                    rankings = [(s, w) for s, w in rankings if s not in inactive]
+                    report.set("inactive_assets_filtered", sorted(inactive))
+            except Exception as e:
+                logger.warning(f"  inactive-asset filter failed: {e}")
+        if not target_symbols:
+            logger.error("All combo positions filtered out — staying in cash")
+            report.add_error("Combo target_symbols empty after filters")
+            logger.info(report.format_summary())
+            return
+        report.set("target_portfolio", rankings)
+    else:
+        # Filter inactive/untradeable assets (e.g. HOLX after delisting).
+        # Walk further down the ranking until we have at least `top_n` tradeable
+        # candidates so a few delistings don't abort the rebalance.
+        if not dry_run and mc.alpaca_key:
+            all_inactive: set[str] = set()
+            check_window = top_n * 2
+            max_window = min(len(rankings), top_n * 5)  # never check more than top 100
+            while True:
+                window_syms = [sym for sym, _ in rankings[:check_window]]
+                inactive = fetch_inactive_assets(window_syms, mc, logger, top_n=top_n)
+                all_inactive.update(inactive)
+                tradeable_in_window = [s for s in window_syms if s not in all_inactive]
+                if len(tradeable_in_window) >= top_n or check_window >= max_window:
+                    break
+                check_window = min(check_window + top_n, max_window)
+                logger.info(
+                    f"  Only {len(tradeable_in_window)}/{top_n} tradeable in top "
+                    f"{check_window - top_n}; extending check to top {check_window}"
+                )
+            if all_inactive:
+                rankings = [(sym, pred) for sym, pred in rankings if sym not in all_inactive]
+                report.set("inactive_assets_filtered", sorted(all_inactive))
+
+        if len(rankings) < top_n:
+            logger.error(f"Only {len(rankings)} predictions - need at least {top_n}")
+            report.add_error(f"Insufficient predictions: {len(rankings)} < {top_n}")
+            logger.info(report.format_summary())
+            return
+
+        # Final guard: re-apply EXCLUDED_SYMBOLS in case a cached universe
+        # pre-dates an exclusion change.
+        rankings = [(sym, p) for sym, p in rankings if sym not in EXCLUDED_SYMBOLS]
+
+        target_symbols = [sym for sym, _ in rankings[:top_n]]
+        report.set("target_portfolio", rankings[:top_n])
+
+        logger.info(f"\n  Target portfolio ({top_n} stocks):")
+        for i, (sym, pred) in enumerate(rankings[:top_n]):
+            logger.info(f"    {i+1:2d}. {sym:6s}  pred={pred:+6.2f}%")
+
+        # -- V6/V8: regime score → conviction-weighted (optionally sector-neutral)
+        target_weights = None
+
+    if (strategy_type != "direct_weights"
+            and mc.feature_version in ("v6", "v8") and macro_data is not None):
         vtag = mc.feature_version.upper()
         logger.info(f"\n  [{vtag}] Computing market regime & conviction weights...")
         try:
