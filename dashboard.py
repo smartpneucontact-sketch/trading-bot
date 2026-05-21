@@ -1748,11 +1748,41 @@ def apiv1_model_detail(model_name):
     desc = pipeline.MODEL_DESCRIPTIONS.get(model_name, {})
     result["description"] = desc
 
+    # Bundle metadata: tag, version, strategy_type, backtest_reference.
+    # Loaded lazily — combo_v1 is 1KB, v9 is ~8.5MB; we accept that read
+    # cost per request because the dashboard caches via setInterval. Errors
+    # are swallowed so the endpoint still works if the file is missing.
+    try:
+        model_path = pipeline._resolve_model_path(model_name)
+        if model_path.exists():
+            from core.runner import load_model_bundle
+            bundle = load_model_bundle(model_path)
+            for k in ("tag", "version", "strategy_type", "horizon",
+                      "saved_at", "backtest_reference"):
+                if k in bundle:
+                    result[k] = bundle[k]
+    except Exception:
+        pass
+
     # State (always available — from state file on disk)
     state = _load_model_state(model_name)
     result["run_count"] = state.get("run_count", 0)
     result["last_rebalance"] = state.get("last_rebalance")
     result["last_run"] = state.get("last_run")
+    # Convenient nested form for the v2 dashboard
+    result["state"] = {
+        "run_count": state.get("run_count", 0),
+        "last_rebalance": state.get("last_rebalance"),
+        "last_run": state.get("last_run"),
+        "portfolio_stop_tripped_date": state.get("portfolio_stop_tripped_date"),
+    }
+    # Lightweight cutloss state — "tier1"/"tier2"/"tier3" derived from
+    # state.portfolio_stop_tripped_date being today (the runner sets this).
+    today = datetime.now().strftime("%Y-%m-%d")
+    if state.get("portfolio_stop_tripped_date") == today:
+        result["cutloss_state"] = "tripped"
+    else:
+        result["cutloss_state"] = "normal"
 
     # Full run history
     history = state.get("history", [])
@@ -2036,6 +2066,346 @@ def apiv1_docs():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "uptime_since": bot_status["started_at"]})
+
+
+# ── V2 DASHBOARD ──────────────────────────────────────────────────────────
+# Clean, focused UI redesign. Lives at /v2 alongside the original /. Uses the
+# existing /api/v1/* endpoints client-side. Single self-contained route — no
+# external templates, no asset pipeline.
+#
+# Layout:
+#   ▸ Hero: aggregate equity + today's P&L across all live slots
+#   ▸ Slot grid: per-slot KPI cards (equity, day/week/month P&L, drawdown,
+#                # positions, cutloss state, last rebal)
+#   ▸ Backtest-vs-live comparison row for each slot that carries a
+#     `backtest_reference` in its bundle (combo_v1, etc.)
+#   ▸ Top winners + losers across the union of all slot positions
+@app.route("/v2")
+def index_v2():
+    return V2_DASHBOARD_HTML
+
+
+V2_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ML Trading Bot — V2</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #131a26;
+    --panel-2: #1a2434;
+    --line: #233146;
+    --text: #e4e8ef;
+    --muted: #8a94a4;
+    --accent: #4dd0e1;
+    --good: #4ade80;
+    --bad: #f87171;
+    --warn: #fbbf24;
+    --neutral: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 24px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+  header h1 { font-size: 22px; margin: 0; font-weight: 600; }
+  header .tag { color: var(--muted); font-size: 12px; margin-left: 12px; padding: 2px 8px; background: var(--panel-2); border-radius: 4px; }
+  header .links a { color: var(--accent); text-decoration: none; margin-left: 16px; font-size: 13px; }
+  header .links a:hover { text-decoration: underline; }
+
+  .hero { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 32px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 20px;
+  }
+  .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 8px; }
+  .stat .value { font-size: 28px; font-weight: 600; font-feature-settings: "tnum"; }
+  .stat .sub { font-size: 13px; color: var(--muted); margin-top: 4px; font-feature-settings: "tnum"; }
+  .good { color: var(--good); }
+  .bad { color: var(--bad); }
+  .neutral { color: var(--neutral); }
+  .warn { color: var(--warn); }
+
+  h2 { font-size: 16px; margin: 0 0 12px 0; font-weight: 600; color: var(--text); }
+  h2 .count { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+
+  .slot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; margin-bottom: 32px; }
+  .slot {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px; position: relative;
+  }
+  .slot .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .slot .name { font-size: 18px; font-weight: 600; }
+  .slot .strategy { font-size: 11px; padding: 3px 8px; background: var(--panel-2); border-radius: 4px; color: var(--muted); margin-left: 8px; vertical-align: middle; }
+  .slot .equity { font-size: 28px; font-weight: 600; font-feature-settings: "tnum"; margin-bottom: 6px; }
+  .slot .day-pnl { font-size: 15px; font-weight: 500; font-feature-settings: "tnum"; }
+  .slot .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+  .slot .kpi .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 4px; }
+  .slot .kpi .v { font-size: 15px; font-weight: 500; font-feature-settings: "tnum"; }
+  .slot .footer { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+  .slot .pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; }
+  .pill-good { background: rgba(74, 222, 128, 0.15); color: var(--good); }
+  .pill-bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); }
+  .pill-warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+  .slot .bt-ref { margin-top: 14px; padding: 10px 12px; background: var(--panel-2); border-radius: 8px; font-size: 12px; color: var(--muted); }
+  .slot .bt-ref strong { color: var(--text); font-weight: 500; }
+
+  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 500; text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 8px 8px; border-bottom: 1px solid var(--line); font-size: 13px; font-feature-settings: "tnum"; }
+  td:first-child { font-weight: 500; }
+  tr:last-child td { border-bottom: 0; }
+
+  .loading { color: var(--muted); padding: 40px; text-align: center; font-size: 14px; }
+  .error { color: var(--bad); padding: 12px 16px; background: rgba(248, 113, 113, 0.08); border: 1px solid rgba(248, 113, 113, 0.2); border-radius: 8px; font-size: 13px; }
+
+  @media (max-width: 800px) {
+    .hero { grid-template-columns: repeat(2, 1fr); }
+    .panels { grid-template-columns: 1fr; }
+    .slot-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div>
+    <h1>ML Trading Bot</h1>
+    <span class="tag">V2 / clean UI</span>
+  </div>
+  <div class="links">
+    <a href="/">Original dashboard</a>
+    <a href="/api/v1/docs">API docs</a>
+  </div>
+</header>
+
+<section id="hero" class="hero">
+  <div class="stat"><div class="label">Total equity</div><div id="hero-equity" class="value">…</div><div id="hero-equity-sub" class="sub">across all slots</div></div>
+  <div class="stat"><div class="label">Today's P&L</div><div id="hero-day-pnl" class="value">…</div><div id="hero-day-pnl-sub" class="sub">all slots combined</div></div>
+  <div class="stat"><div class="label">Active slots</div><div id="hero-slots" class="value">…</div><div id="hero-slots-sub" class="sub">paper trading</div></div>
+  <div class="stat"><div class="label">Market</div><div id="hero-market" class="value">…</div><div id="hero-market-sub" class="sub">…</div></div>
+</section>
+
+<h2>Slots <span class="count" id="slot-count"></span></h2>
+<section id="slot-grid" class="slot-grid">
+  <div class="loading">Loading slot data…</div>
+</section>
+
+<section class="panels">
+  <div class="panel">
+    <h2>Top winners <span class="count">across all positions</span></h2>
+    <div id="winners"><div class="loading">…</div></div>
+  </div>
+  <div class="panel">
+    <h2>Top losers <span class="count">across all positions</span></h2>
+    <div id="losers"><div class="loading">…</div></div>
+  </div>
+</section>
+
+</div>
+
+<script>
+const fmtUSD = (x) => x == null || isNaN(x) ? '—' : (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const fmtUSDc = (x) => x == null || isNaN(x) ? '—' : (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtPct = (x) => x == null || isNaN(x) ? '—' : (x >= 0 ? '+' : '') + (x * 100).toFixed(2) + '%';
+const fmtPctNoSign = (x) => x == null || isNaN(x) ? '—' : (x * 100).toFixed(1) + '%';
+const cls = (x) => x == null || isNaN(x) || x === 0 ? 'neutral' : (x > 0 ? 'good' : 'bad');
+
+async function jget(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} → HTTP ${r.status}`);
+  return r.json();
+}
+
+function pctChange(series) {
+  if (!series || series.length < 2) return null;
+  const first = series[0]?.equity ?? series[0]?.value ?? series[0];
+  const last = series[series.length - 1]?.equity ?? series[series.length - 1]?.value ?? series[series.length - 1];
+  if (!first || !last) return null;
+  return last / first - 1;
+}
+
+async function loadSlot(modelName) {
+  const result = { name: modelName, error: null };
+  try {
+    const model = await jget(`/api/v1/models/${modelName}`);
+    result.model = model;
+    result.active = !!model.active;
+    if (!result.active) return result;
+  } catch (e) { result.error = e.message; return result; }
+  try { result.account = await jget(`/api/v1/account/${modelName}`); } catch (e) {}
+  try { result.positions = await jget(`/api/v1/positions/${modelName}`); } catch (e) {}
+  try { result.equity1M = await jget(`/api/v1/equity/${modelName}?period=1M`); } catch (e) {}
+  try { result.equity1W = await jget(`/api/v1/equity/${modelName}?period=1W`); } catch (e) {}
+  try { result.equity1D = await jget(`/api/v1/equity/${modelName}?period=1D`); } catch (e) {}
+  return result;
+}
+
+function pickEquitySeries(eq) {
+  if (!eq) return null;
+  if (Array.isArray(eq.equity)) return eq.equity;
+  if (Array.isArray(eq.points)) return eq.points;
+  if (Array.isArray(eq)) return eq;
+  return null;
+}
+
+function maxDrawdown(series) {
+  if (!series || series.length < 2) return null;
+  const vals = series.map(p => p?.equity ?? p?.value ?? p).filter(Number.isFinite);
+  if (vals.length < 2) return null;
+  let peak = vals[0], maxDD = 0;
+  for (const v of vals) {
+    if (v > peak) peak = v;
+    const dd = v / peak - 1;
+    if (dd < maxDD) maxDD = dd;
+  }
+  return maxDD;
+}
+
+function renderSlot(r) {
+  const el = document.createElement('div');
+  el.className = 'slot';
+  if (!r.active) {
+    el.innerHTML = `<div class="head"><div><span class="name">${r.name}</span><span class="strategy">inactive</span></div></div><div class="footer">Slot not assigned an Alpaca key.</div>`;
+    return el;
+  }
+  if (r.error) {
+    el.innerHTML = `<div class="head"><span class="name">${r.name}</span></div><div class="error">${r.error}</div>`;
+    return el;
+  }
+  const a = r.account || {};
+  const positions = (r.positions && r.positions.positions) || [];
+  const equity = +(a.equity ?? a.portfolio_value ?? 0);
+  const lastEquity = +(a.last_equity ?? equity);
+  const dayPnl = equity - lastEquity;
+  const dayPnlPct = lastEquity ? dayPnl / lastEquity : 0;
+
+  const s1M = pickEquitySeries(r.equity1M);
+  const s1W = pickEquitySeries(r.equity1W);
+  const ret1M = pctChange(s1M);
+  const ret1W = pctChange(s1W);
+  const dd = maxDrawdown(s1M);
+
+  const cutlossState = (r.model && r.model.cutloss_state) || null;
+  let pill = `<span class="pill pill-good">healthy</span>`;
+  if (cutlossState === "tier3" || cutlossState === "tripped") pill = `<span class="pill pill-bad">circuit-broken</span>`;
+  else if (cutlossState === "tier1" || cutlossState === "tier2") pill = `<span class="pill pill-warn">${cutlossState}</span>`;
+
+  const lastRebal = r.model && r.model.state && r.model.state.last_rebalance;
+  const lastRebalStr = lastRebal ? new Date(lastRebal).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'never';
+
+  let btRef = '';
+  if (r.model && r.model.backtest_reference) {
+    const bt = r.model.backtest_reference;
+    btRef = `<div class="bt-ref">Backtest claim: <strong>${fmtPctNoSign(bt.mean_monthly_return)}</strong> mean/mo, Sharpe <strong>${bt.sharpe?.toFixed(2)}</strong>, max DD <strong>${fmtPctNoSign(bt.max_drawdown)}</strong> over ${bt.window || 'reference window'}.</div>`;
+  }
+
+  el.innerHTML = `
+    <div class="head">
+      <div>
+        <span class="name">${r.name}</span>
+        <span class="strategy">${(r.model && r.model.tag) || (r.model && r.model.version) || 'ml_ranker'}</span>
+      </div>
+      ${pill}
+    </div>
+    <div class="equity">${fmtUSDc(equity)}</div>
+    <div class="day-pnl ${cls(dayPnl)}">${fmtUSD(dayPnl)} <span style="opacity: 0.7; font-size: 13px;">today (${fmtPct(dayPnlPct)})</span></div>
+    <div class="kpis">
+      <div class="kpi"><div class="k">7-day return</div><div class="v ${cls(ret1W)}">${fmtPct(ret1W)}</div></div>
+      <div class="kpi"><div class="k">30-day return</div><div class="v ${cls(ret1M)}">${fmtPct(ret1M)}</div></div>
+      <div class="kpi"><div class="k">Drawdown (30d)</div><div class="v ${cls(dd)}">${fmtPct(dd)}</div></div>
+      <div class="kpi"><div class="k">Positions</div><div class="v">${positions.length}</div></div>
+      <div class="kpi"><div class="k">Cash</div><div class="v">${fmtUSD(+(a.cash || 0))}</div></div>
+      <div class="kpi"><div class="k">Last rebalance</div><div class="v">${lastRebalStr}</div></div>
+    </div>
+    ${btRef}
+  `;
+  return el;
+}
+
+function renderTopMovers(allPositions) {
+  const tbl = (rows) => {
+    if (!rows.length) return '<div class="loading">No positions found.</div>';
+    const html = `<table><thead><tr><th>Slot</th><th>Symbol</th><th style="text-align:right">P&L</th><th style="text-align:right">% Δ</th></tr></thead><tbody>
+      ${rows.map(r => `<tr><td>${r.slot}</td><td>${r.symbol}</td><td style="text-align:right" class="${cls(r.pnl)}">${fmtUSD(r.pnl)}</td><td style="text-align:right" class="${cls(r.pct)}">${fmtPct(r.pct)}</td></tr>`).join('')}
+    </tbody></table>`;
+    return html;
+  };
+  const sorted = allPositions.slice().filter(p => isFinite(p.pct)).sort((a,b) => b.pct - a.pct);
+  document.getElementById('winners').innerHTML = tbl(sorted.slice(0, 10));
+  document.getElementById('losers').innerHTML = tbl(sorted.slice(-10).reverse());
+}
+
+async function refresh() {
+  try {
+    const models = await jget('/api/v1/models');
+    const all = (models.models || models).filter(m => m.active !== false);
+    document.getElementById('hero-slots').textContent = all.length;
+    document.getElementById('slot-count').textContent = `(${all.length} active)`;
+
+    const grid = document.getElementById('slot-grid');
+    grid.innerHTML = '';
+
+    let totalEquity = 0, totalDayPnl = 0;
+    const allPositions = [];
+    const slotResults = await Promise.all(all.map(m => loadSlot(m.name)));
+    for (const r of slotResults) {
+      grid.appendChild(renderSlot(r));
+      if (r.active && r.account) {
+        const eq = +(r.account.equity || 0);
+        const lastEq = +(r.account.last_equity || eq);
+        totalEquity += eq;
+        totalDayPnl += (eq - lastEq);
+      }
+      const positions = (r.positions && r.positions.positions) || [];
+      for (const p of positions) {
+        allPositions.push({
+          slot: r.name,
+          symbol: p.symbol,
+          pnl: +(p.unrealized_pl || p.unrealized_pnl || 0),
+          pct: +((p.unrealized_plpc ?? p.unrealized_pl_pct) || 0) * (Math.abs((p.unrealized_plpc ?? p.unrealized_pl_pct) || 0) > 1 ? 0.01 : 1),
+        });
+      }
+    }
+
+    document.getElementById('hero-equity').textContent = fmtUSDc(totalEquity);
+    document.getElementById('hero-equity-sub').textContent = `across ${all.length} slot${all.length === 1 ? '' : 's'}`;
+    document.getElementById('hero-day-pnl').textContent = fmtUSD(totalDayPnl);
+    document.getElementById('hero-day-pnl').className = 'value ' + cls(totalDayPnl);
+    const dpp = totalEquity ? (totalDayPnl / (totalEquity - totalDayPnl)) : 0;
+    document.getElementById('hero-day-pnl-sub').textContent = fmtPct(dpp) + ' all slots combined';
+
+    renderTopMovers(allPositions);
+
+    // Market hours hint
+    const now = new Date();
+    const wd = now.getUTCDay();
+    const hUTC = now.getUTCHours() + now.getUTCMinutes() / 60;
+    const open = (wd >= 1 && wd <= 5 && hUTC >= 13.5 && hUTC < 20);
+    document.getElementById('hero-market').textContent = open ? 'OPEN' : 'CLOSED';
+    document.getElementById('hero-market').className = 'value ' + (open ? 'good' : 'neutral');
+    document.getElementById('hero-market-sub').textContent = now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+  } catch (e) {
+    document.getElementById('slot-grid').innerHTML = `<div class="error">Load failed: ${e.message}</div>`;
+  }
+}
+
+refresh();
+setInterval(refresh, 30000);  // refresh every 30s
+</script>
+</body>
+</html>"""
 
 
 # ── MAIN HTML PAGE ────────────────────────────────────────────────────────
