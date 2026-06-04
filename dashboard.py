@@ -16,6 +16,7 @@ Usage:
     python dashboard.py --port 8080  # Custom port
 """
 
+import functools
 import json
 import logging
 import os
@@ -1751,21 +1752,11 @@ def apiv1_model_detail(model_name):
     desc = pipeline.MODEL_DESCRIPTIONS.get(model_name, {})
     result["description"] = desc
 
-    # Bundle metadata: tag, version, strategy_type, backtest_reference.
-    # Loaded lazily — combo_v1 is 1KB, v9 is ~8.5MB; we accept that read
-    # cost per request because the dashboard caches via setInterval. Errors
-    # are swallowed so the endpoint still works if the file is missing.
-    try:
-        model_path = pipeline._resolve_model_path(model_name)
-        if model_path.exists():
-            from core.runner import load_model_bundle
-            bundle = load_model_bundle(model_path)
-            for k in ("tag", "version", "strategy_type", "horizon",
-                      "saved_at", "backtest_reference"):
-                if k in bundle:
-                    result[k] = bundle[k]
-    except Exception:
-        pass
+    # Bundle metadata via LRU-cached loader (see _get_bundle_metadata).
+    # combo_v1 is 1 KB so cost is trivial; v9 is 8.5 MB so caching saves
+    # ~40 MB of pickle deserialization per minute at /v2's 30s refresh.
+    for k, v in _get_bundle_metadata(model_name).items():
+        result[k] = v
 
     # State (always available — from state file on disk)
     state = _load_model_state(model_name)
@@ -1779,23 +1770,53 @@ def apiv1_model_detail(model_name):
         "last_run": state.get("last_run"),
         "portfolio_stop_tripped_date": state.get("portfolio_stop_tripped_date"),
     }
-    # Lightweight cutloss state — "tier1"/"tier2"/"tier3" derived from
-    # state.portfolio_stop_tripped_date being today (the runner sets this).
+    # Cutloss state — match the tiers from core/risk.py exactly:
+    #   Tier 3 (= "tripped" when persisted): daily DD ≤ pstop × 7/3
+    #   Tier 2: daily DD ≤ pstop × 5/3 (no trip flag)
+    #   Tier 1: daily DD ≤ pstop (no trip flag)
+    #   else:  "normal"
+    # Tier 2/3 only fire intraday (the 60s scanner) so without a live
+    # equity number we fall back to "tripped" iff today's persisted flag
+    # is set. With a live equity we can compute the current tier.
     today = datetime.now().strftime("%Y-%m-%d")
     if state.get("portfolio_stop_tripped_date") == today:
         result["cutloss_state"] = "tripped"
     else:
-        result["cutloss_state"] = "normal"
+        result["cutloss_state"] = "normal"  # may be upgraded below
+    # Upgrade with a live tier read if we have an active slot + start equity
+    if mc and mc.enable_cutloss and state.get("daily_portfolio_start_date") == today:
+        try:
+            acct_live = pipeline.alpaca_request("GET", "v2/account", mc,
+                                                logger=logger)
+            cur_eq = float(acct_live.get("equity", 0))
+            start_eq = float(state.get("daily_portfolio_start", 0) or 0)
+            if start_eq > 0 and cur_eq > 0:
+                dd_pct = (cur_eq / start_eq - 1.0) * 100.0
+                pstop = float(mc.cutloss_portfolio_stop)  # negative
+                if dd_pct <= pstop * (7.0 / 3.0):
+                    result["cutloss_state"] = "tier3"
+                elif dd_pct <= pstop * (5.0 / 3.0):
+                    result["cutloss_state"] = "tier2"
+                elif dd_pct <= pstop:
+                    result["cutloss_state"] = "tier1"
+                result["cutloss_daily_dd_pct"] = round(dd_pct, 4)
+        except Exception:
+            pass
 
     # Full run history
     history = state.get("history", [])
     result["history_count"] = len(history)
     if history:
         latest = history[-1]
+        # direct_weights strategies (combo_v1) store under "weights";
+        # ml_ranker strategies (v4/v5/v6/v8/v9) store under "predictions".
+        # Surface whichever exists so the dashboard works for both.
         result["latest_picks"] = {
             "date": latest.get("date"),
             "symbols": latest.get("target_symbols", []),
             "predictions": latest.get("predictions", {}),
+            "weights": latest.get("weights", {}),
+            "strategy_type": latest.get("strategy_type", "ml_ranker"),
             "conviction_weights": latest.get("conviction_weights", {}),
             "regime_exposure": latest.get("regime_exposure"),
         }
@@ -2069,6 +2090,55 @@ def apiv1_docs():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "uptime_since": bot_status["started_at"]})
+
+
+@app.route("/api/v1/market-status", methods=["GET", "OPTIONS"])
+def apiv1_market_status():
+    """Whether the US equity market is currently open. Uses the same
+    `core.market.is_market_open()` used by the pipeline so the dashboard
+    indicator always matches reality (DST-aware, holiday-aware).
+    """
+    if flask_request.method == "OPTIONS":
+        return _cors_response({})
+    try:
+        from core.market import is_market_open
+        is_open = bool(is_market_open())
+    except Exception as e:
+        return _cors_response({"error": str(e)}, 500)
+    return _cors_response({
+        "is_open": is_open,
+        "checked_at": datetime.utcnow().isoformat() + "Z",
+    })
+
+
+# ── Bundle metadata cache ─────────────────────────────────────────────────
+# /api/v1/models/<name> exposes a subset of the model bundle (tag, version,
+# strategy_type, backtest_reference, ...). Without caching, each call
+# deserializes the full pickle — that's 8.5 MB for v9 — every time. At
+# /v2's 30s refresh × 5 slots that's >40 MB/min of pure waste. The cache
+# is keyed by (path, mtime) so a fresh bundle (re-deploy or rebuild)
+# invalidates automatically without a server restart.
+
+_BUNDLE_META_KEYS = ("tag", "version", "strategy_type", "horizon",
+                     "saved_at", "backtest_reference")
+
+
+@functools.lru_cache(maxsize=32)
+def _load_bundle_meta_cached(path_str: str, mtime: float) -> dict:
+    from core.runner import load_model_bundle
+    bundle = load_model_bundle(path_str)
+    return {k: bundle[k] for k in _BUNDLE_META_KEYS if k in bundle}
+
+
+def _get_bundle_metadata(model_name: str) -> dict:
+    """Return the cached metadata subset of a model bundle, or {} on miss."""
+    try:
+        model_path = pipeline._resolve_model_path(model_name)
+        if not model_path.exists():
+            return {}
+        return _load_bundle_meta_cached(str(model_path), model_path.stat().st_mtime)
+    except Exception:
+        return {}
 
 
 # ── V2 DASHBOARD ──────────────────────────────────────────────────────────
@@ -2373,11 +2443,16 @@ async function refresh() {
       }
       const positions = (r.positions && r.positions.positions) || [];
       for (const p of positions) {
+        // /api/v1/positions/<name> returns unrealized_plpc as a percent
+        // (e.g. 5.2 means 5.2%). The hero/KPI fmtPct expects DECIMAL, so
+        // divide by 100 once at intake. Endpoints are not changing because
+        // the original / dashboard depends on the percent encoding.
+        const plpcPct = +((p.unrealized_plpc ?? p.unrealized_pl_pct) || 0);
         allPositions.push({
           slot: r.name,
           symbol: p.symbol,
           pnl: +(p.unrealized_pl || p.unrealized_pnl || 0),
-          pct: +((p.unrealized_plpc ?? p.unrealized_pl_pct) || 0) * (Math.abs((p.unrealized_plpc ?? p.unrealized_pl_pct) || 0) > 1 ? 0.01 : 1),
+          pct: plpcPct / 100,
         });
       }
     }
@@ -2391,14 +2466,21 @@ async function refresh() {
 
     renderTopMovers(allPositions);
 
-    // Market hours hint
+    // Market hours: source of truth is the server-side is_market_open()
+    // via /api/v1/market-status (DST + holiday aware). JS time-zone math
+    // can't replicate that reliably.
+    let isOpen = null;
+    try {
+      const ms = await jget('/api/v1/market-status');
+      isOpen = !!ms.is_open;
+    } catch (e) {}
     const now = new Date();
-    const wd = now.getUTCDay();
-    const hUTC = now.getUTCHours() + now.getUTCMinutes() / 60;
-    const open = (wd >= 1 && wd <= 5 && hUTC >= 13.5 && hUTC < 20);
-    document.getElementById('hero-market').textContent = open ? 'OPEN' : 'CLOSED';
-    document.getElementById('hero-market').className = 'value ' + (open ? 'good' : 'neutral');
-    document.getElementById('hero-market-sub').textContent = now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+    document.getElementById('hero-market').textContent =
+      isOpen === null ? '—' : (isOpen ? 'OPEN' : 'CLOSED');
+    document.getElementById('hero-market').className =
+      'value ' + (isOpen === true ? 'good' : isOpen === false ? 'neutral' : 'neutral');
+    document.getElementById('hero-market-sub').textContent =
+      now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
   } catch (e) {
     document.getElementById('slot-grid').innerHTML = `<div class="error">Load failed: ${e.message}</div>`;
   }

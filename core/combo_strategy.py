@@ -186,6 +186,12 @@ class ComboConfig:
     dual_top_n: int = 30
     ts_weight: float = 0.25         # ts_momentum_multiasset sleeve
 
+    # Vol-targeting knobs (per sleeve). Previously hard-coded in the sleeve
+    # functions, surfaced here so the bundle's tuning is fully captured by
+    # ComboConfig. Defaults preserve the backtest values.
+    dual_vol_target: float = 0.15   # dual_momentum sleeve realised-vol cap
+    ts_vol_target: float = 0.20     # ts_multi_asset sleeve realised-vol cap
+
     spy_dd_lookback: int = 60
     spy_full_dd: float = 0.08
     spy_cash_dd: float = 0.18
@@ -198,6 +204,20 @@ class ComboConfig:
     # Min weight to keep in the final dict — tiny tail weights cost more
     # in turnover than they earn in diversification.
     min_position_weight: float = 0.005
+
+    def __post_init__(self):
+        # Sleeve weights must sum to 1.0 — a misconfigured config that
+        # sums to 0.8 silently caps the book at 80% gross exposure even
+        # when the operator intended 100%. Fail loudly at construction
+        # time so a bad bundle is caught at build / load, not at trade.
+        total = (self.mom_weight + self.fast_weight
+                 + self.dual_weight + self.ts_weight)
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"ComboConfig sleeve weights sum to {total:.6f}, expected 1.0. "
+                f"Got mom={self.mom_weight}, fast={self.fast_weight}, "
+                f"dual={self.dual_weight}, ts={self.ts_weight}."
+            )
 
 
 class ComboStrategy:
@@ -231,9 +251,13 @@ class ComboStrategy:
         # ── compute each sleeve ─────────────────────────────────────────
         w_mom = _xs_momentum_weights(stock_px, n_long=c.mom_top_n)
         w_fast = _xs_momentum_fast_weights(stock_px, n_long=c.fast_top_n)
-        w_dual = _dual_momentum_voltarget_weights(stock_px, n_long=c.dual_top_n)
-        w_ts = _ts_momentum_multiasset_weights(macro_px,
-                                               tickers=list(c.multi_asset_tickers))
+        w_dual = _dual_momentum_voltarget_weights(
+            stock_px, n_long=c.dual_top_n, target_vol=c.dual_vol_target,
+        )
+        w_ts = _ts_momentum_multiasset_weights(
+            macro_px, tickers=list(c.multi_asset_tickers),
+            target_vol=c.ts_vol_target,
+        )
 
         # ── blend by sleeve weights ─────────────────────────────────────
         combined: dict[str, float] = {}

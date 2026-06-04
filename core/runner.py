@@ -504,10 +504,19 @@ def run_single_model(
         "date": datetime.now().isoformat(),
         "run_id": f"{mc.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}",
         "target_symbols": target_symbols,
-        "predictions": {s: round(p, 4) for s, p in rankings[:top_n]},
+        "strategy_type": strategy_type,
         "result": {k: v for k, v in result.items()
                    if k not in ("sells_detail", "buys_detail")},
     }
+    # For ml_ranker, `rankings` is (sym, predicted_return); for
+    # direct_weights it's (sym, weight). Same dict shape — different
+    # semantics. Store under the right key so downstream readers
+    # (performance API, dashboards) don't misinterpret weights as
+    # alpha predictions.
+    if strategy_type == "direct_weights":
+        history_entry["weights"] = {s: round(p, 6) for s, p in rankings[:top_n]}
+    else:
+        history_entry["predictions"] = {s: round(p, 4) for s, p in rankings[:top_n]}
     if target_weights is not None:
         history_entry["regime_exposure"] = round(regime_exposure, 4)
         history_entry["conviction_weights"] = {

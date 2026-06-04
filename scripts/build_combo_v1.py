@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pickle
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Make `core` importable when running from deploy/
@@ -32,11 +32,14 @@ OUT.parent.mkdir(parents=True, exist_ok=True)
 
 def main() -> None:
     config = ComboConfig(
-        # Sleeve allocations (must sum to 1.0 to use full notional)
+        # Sleeve allocations (must sum to 1.0; __post_init__ asserts)
         mom_weight=0.30, mom_top_n=30,
         fast_weight=0.25, fast_top_n=20,
         dual_weight=0.20, dual_top_n=30,
         ts_weight=0.25,
+        # Vol-targeting (per sleeve, captured in bundle for full reproducibility)
+        dual_vol_target=0.15,
+        ts_vol_target=0.20,
         # Risk overlay
         spy_dd_lookback=60,
         spy_full_dd=0.08,
@@ -55,7 +58,7 @@ def main() -> None:
         "tag": "Combo 4-signal multi-horizon multi-asset momentum",
         # Carry the config explicitly for inspection-friendly bundles
         "combo_config": config,
-        "saved_at": datetime.utcnow().isoformat() + "Z",
+        "saved_at": datetime.now(timezone.utc).isoformat(),
         # Backtest reference (from /Traiding 11/REPORT.md, 10-yr Apr-2016 → Mar-2026)
         "backtest_reference": {
             "window": "2016-04-01..2026-03-27",
