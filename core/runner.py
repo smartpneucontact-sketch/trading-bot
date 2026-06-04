@@ -229,6 +229,13 @@ def run_single_model(
     logger.info("\n[4/5] GENERATING PREDICTIONS")
     logger.info(f"  Feature version: {mc.feature_version}")
 
+    # Defensive defaults — these get overwritten by the strategy_type branch
+    # or the v6/v8 regime block below, but every code path further down
+    # reads them at least conditionally. Initialising here means a future
+    # edit that drops a guard can't trip NameError.
+    target_weights: dict[str, float] | None = None
+    regime_exposure = 1.0
+
     # ── Branch A: direct-weights strategies (combo_v1 etc.) ───────────
     # These bypass the rank+conviction path because they need to size
     # macro ETFs and multi-horizon stock sleeves in one shot.
@@ -278,8 +285,9 @@ def run_single_model(
 
         # Skip the prediction-quality filters and jump straight to rebalance.
         # (The rest of the function uses `rankings`, `target_symbols`,
-        #  `target_weights` exactly as the rank path does.)
-        regime_exposure = 1.0
+        #  `target_weights` exactly as the rank path does. regime_exposure
+        #  stays at 1.0 — direct-weights strategies handle regime gating
+        #  internally, see combo_strategy._spy_drawdown_gate.)
 
     else:
         rankings = predict_rankings(
@@ -367,7 +375,8 @@ def run_single_model(
             logger.info(f"    {i+1:2d}. {sym:6s}  pred={pred:+6.2f}%")
 
         # -- V6/V8: regime score → conviction-weighted (optionally sector-neutral)
-        target_weights = None
+        # target_weights / regime_exposure already initialized defensively
+        # above (line ~232). The v6/v8 block below may overwrite them.
 
     if (strategy_type != "direct_weights"
             and mc.feature_version in ("v6", "v8") and macro_data is not None):

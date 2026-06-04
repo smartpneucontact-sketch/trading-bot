@@ -100,7 +100,7 @@ def _dual_momentum_voltarget_weights(px: pd.DataFrame, n_long: int = 30,
         return {}
     last = px.iloc[-1]
     base = px.iloc[-(lookback + 1)]
-    daily = px.pct_change(fill_method=None)
+    daily = px.pct_change()
     vol = daily.iloc[-vol_lookback:].std() * np.sqrt(252)
     mom = (last / base - 1.0)
     mom = mom[(last.notna()) & (base.notna())].replace([np.inf, -np.inf], np.nan).dropna()
@@ -133,7 +133,7 @@ def _ts_momentum_multiasset_weights(macro_close: pd.DataFrame,
     sub = macro_close[available]
     last = sub.iloc[-1]
     base = sub.iloc[-(lookback + 1)]
-    daily = sub.pct_change(fill_method=None)
+    daily = sub.pct_change()
     vol = daily.iloc[-vol_lookback:].std() * np.sqrt(252)
     mom = (last / base - 1.0)
     mom = mom[(last.notna()) & (base.notna())].replace([np.inf, -np.inf], np.nan).dropna()

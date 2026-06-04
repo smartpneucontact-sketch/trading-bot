@@ -1504,8 +1504,11 @@ def api_config_update():
         new_slots = data["slots"]
 
         # Validate
-        if len(new_slots) > 3:
-            return jsonify({"error": "Maximum 3 slots allowed"}), 400
+        # Cap raised to 8 (was 3) so the dashboard accepts the v9 + combo_v1
+        # slots added after the original 3-slot design. The JS side already
+        # renders Math.max(slots.length, 4) so it scales automatically.
+        if len(new_slots) > 8:
+            return jsonify({"error": "Maximum 8 slots allowed"}), 400
 
         for slot in new_slots:
             model = slot.get("model", "")

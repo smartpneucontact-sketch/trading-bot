@@ -332,11 +332,15 @@ def _default_config() -> dict:
                 # earlier on raw market moves, which is exactly the tail
                 # protection we want for a high-leverage book.
                 # NOTE: 2.5x leverage may exceed Alpaca paper's default
-                # buying power (≈2.37x). If orders reject, reduce
-                # target_leverage to 2.0 via the dashboard.
+                # buying power (≈2.37x). The rebalance auto-scales to bp
+                # if needed; you can also reduce target_leverage to 2.0
+                # via the dashboard.
+                # Ships with enabled=False so the slot stays quiet in logs
+                # ("key=NO" every tick is noise) until the operator adds an
+                # Alpaca key and flips it on via Settings.
                 "slot_id": 5,
                 "model": "combo_v1",
-                "enabled": True,
+                "enabled": False,
                 "alpaca_key": "",
                 "alpaca_secret": "",
                 "enable_cutloss": True,

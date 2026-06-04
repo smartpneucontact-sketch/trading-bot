@@ -196,23 +196,40 @@ def rebalance_portfolio(
 
     rb_data["target_leverage"] = leverage
 
-    # Pre-flight check: at higher leverage, Alpaca's buying_power must
-    # cover the total target notional. If not, log warning and continue
-    # (Alpaca will reject overage orders; better to surface this clearly).
+    # Pre-flight: if total target notional exceeds Alpaca buying_power,
+    # auto-scale every allocation by the same factor so the rebalance fits.
+    # Without this, Alpaca rejects overage orders one-by-one — the partial
+    # fills leave the book in a state where the *next* rebalance sees stale
+    # positions and over/under-corrects. Auto-scaling produces a clean,
+    # consistent book at the available leverage.
     total_target_notional = sum(sym_allocations.values())
     bp = float(acct.get("buying_power", 0))
-    if total_target_notional > bp:
+    if total_target_notional > bp and bp > 0:
+        scale = bp / total_target_notional
+        sym_allocations = {sym: alloc * scale
+                           for sym, alloc in sym_allocations.items()}
+        realized_leverage = (bp / portfolio_value) if portfolio_value else 0.0
         logger.warning(
-            f"  [REBALANCE] target notional ${total_target_notional:,.2f} "
-            f"exceeds buying_power ${bp:,.2f} (leverage={leverage}x, "
-            f"equity=${portfolio_value:,.2f}). "
-            f"Alpaca will likely reject some orders — consider reducing "
-            f"target_leverage to {bp / max(portfolio_value, 1):.2f}x or lower."
+            f"  [REBALANCE] AUTO-SCALED allocations: requested notional "
+            f"${total_target_notional:,.2f} > buying_power ${bp:,.2f} "
+            f"(requested leverage={leverage:.2f}x, equity=${portfolio_value:,.2f}). "
+            f"Scaling all positions by {scale:.4f} → "
+            f"realized leverage ~{realized_leverage:.2f}x. "
+            f"Update target_leverage to {realized_leverage:.2f}x or lower "
+            f"to silence this warning."
         )
         report.add_warning(
-            f"target notional ${total_target_notional:,.0f} > buying_power "
-            f"${bp:,.0f}; orders may be rejected"
+            f"auto-scaled to buying_power: ${total_target_notional:,.0f}→"
+            f"${bp:,.0f} (realized leverage {realized_leverage:.2f}x)"
         )
+        rb_data["auto_scaled_to_buying_power"] = True
+        rb_data["requested_leverage"] = leverage
+        rb_data["realized_leverage"] = realized_leverage
+        # Refresh the total for downstream code that reads it
+        total_target_notional = sum(sym_allocations.values())
+    else:
+        rb_data["auto_scaled_to_buying_power"] = False
+        rb_data["realized_leverage"] = leverage
 
     total_positions = max(len(target_set) + len(current_set), 1)
     turnover = (len(to_sell) + len(to_buy)) / total_positions
