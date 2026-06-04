@@ -14,8 +14,9 @@ What's in it (matches the backtest in /Traiding 11/REPORT.md):
   - 30 % xs_momentum_top30 — long top-30 stocks by 12-1 month return
   - 25 % xs_momentum_fast — long top-20 stocks by 3-1 wk return
   - 20 % dual_momentum_vol — long top-30 by 6-mo return, inverse-vol-weighted
-  - 25 % ts_momentum_multiasset — long the 22 macro/sector ETFs whose
-                                  12-mo return is positive, inverse-vol-weighted
+  - 25 % ts_momentum_multiasset — long each of the 20 macro/sector ETFs in
+                                  DEFAULT_MULTI_ASSET_TICKERS whose 12-mo
+                                  return is positive, inverse-vol-weighted
 
 Then two overlays applied to the combined weight vector:
 
@@ -199,6 +200,9 @@ class ComboConfig:
     # Cap on the un-leveraged portfolio exposure after overlays
     max_gross_exposure: float = 1.0
 
+    # Stored as tuple (dataclass-safe; mutable default would need field()),
+    # consumed as list inside compute_weights. Frozen list rather than
+    # default-mutable.
     multi_asset_tickers: tuple = tuple(DEFAULT_MULTI_ASSET_TICKERS)
 
     # Min weight to keep in the final dict — tiny tail weights cost more
@@ -292,10 +296,15 @@ class ComboStrategy:
 
         return combined
 
-    # ── ML-style API (no-op fallback) ─────────────────────────────────
+    # ── ML-style API (intentionally unimplemented) ─────────────────────
     def predict(self, X):
-        """Zero prediction stub — present so any caller that bypasses
-        compute_weights and tries the ML rank path gets zeros and skips
-        the strategy gracefully rather than crashing."""
-        n = len(X)
-        return [0.0] * n
+        """Fails loudly. ComboStrategy is direct_weights; the runner must
+        route through compute_weights() via `strategy_type` in the bundle.
+        A silent zero stub here would let a misconfigured bundle trade
+        flat without anyone noticing — much worse than a hard error.
+        """
+        raise NotImplementedError(
+            "ComboStrategy.predict() is intentionally not implemented. "
+            "Ensure the model bundle sets strategy_type='direct_weights' "
+            "so the runner dispatches to compute_weights() instead."
+        )

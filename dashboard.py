@@ -2371,9 +2371,11 @@ function renderSlot(r) {
   const dd = maxDrawdown(s1M);
 
   const cutlossState = (r.model && r.model.cutloss_state) || null;
+  const lastRebalRaw = r.model && r.model.state && r.model.state.last_rebalance;
   let pill = `<span class="pill pill-good">healthy</span>`;
   if (cutlossState === "tier3" || cutlossState === "tripped") pill = `<span class="pill pill-bad">circuit-broken</span>`;
   else if (cutlossState === "tier1" || cutlossState === "tier2") pill = `<span class="pill pill-warn">${cutlossState}</span>`;
+  else if (!lastRebalRaw && positions.length === 0) pill = `<span class="pill" style="background:rgba(148,163,184,0.15);color:var(--neutral)">pending first rebalance</span>`;
 
   const lastRebal = r.model && r.model.state && r.model.state.last_rebalance;
   const lastRebalStr = lastRebal ? new Date(lastRebal).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : 'never';
@@ -2381,7 +2383,7 @@ function renderSlot(r) {
   let btRef = '';
   if (r.model && r.model.backtest_reference) {
     const bt = r.model.backtest_reference;
-    btRef = `<div class="bt-ref">Backtest claim: <strong>${fmtPctNoSign(bt.mean_monthly_return)}</strong> mean/mo, Sharpe <strong>${bt.sharpe?.toFixed(2)}</strong>, max DD <strong>${fmtPctNoSign(bt.max_drawdown)}</strong> over ${bt.window || 'reference window'}.</div>`;
+    btRef = `<div class="bt-ref" title="Backtest reference figures from the model bundle's backtest_reference dict — not live performance.">Backtest claim: <strong>${fmtPctNoSign(bt.mean_monthly_return)}</strong> mean/mo, Sharpe <strong>${bt.sharpe?.toFixed(2)}</strong>, max DD <strong>${fmtPctNoSign(bt.max_drawdown)}</strong> over ${bt.window || 'reference window'}.</div>`;
   }
 
   el.innerHTML = `
@@ -2397,7 +2399,7 @@ function renderSlot(r) {
     <div class="kpis">
       <div class="kpi"><div class="k">7-day return</div><div class="v ${cls(ret1W)}">${fmtPct(ret1W)}</div></div>
       <div class="kpi"><div class="k">30-day return</div><div class="v ${cls(ret1M)}">${fmtPct(ret1M)}</div></div>
-      <div class="kpi"><div class="k">Drawdown (30d)</div><div class="v ${cls(dd)}">${fmtPct(dd)}</div></div>
+      <div class="kpi" title="Max drawdown computed over the last 30-day rolling window. Not comparable to backtest since-inception DD."><div class="k">Max DD (30d)</div><div class="v ${cls(dd)}">${fmtPct(dd)}</div></div>
       <div class="kpi"><div class="k">Positions</div><div class="v">${positions.length}</div></div>
       <div class="kpi"><div class="k">Cash</div><div class="v">${fmtUSD(+(a.cash || 0))}</div></div>
       <div class="kpi"><div class="k">Last rebalance</div><div class="v">${lastRebalStr}</div></div>
